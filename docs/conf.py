@@ -9,15 +9,13 @@ import sys
 _HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, '../src')))
 
-import sparc.client
-
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'sparc.client'
-copyright = '2023, NIH SPARC'
-author = 'NIH SPARC'
-release = '0.0.2'
+project = 'deepFRI2'
+copyright = ''
+author = 'Patryk Orzechowski, Tomasz Kościółek'
+release = '0.0.1'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
