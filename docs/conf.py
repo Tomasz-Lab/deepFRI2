@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, '../src')))
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'deepFRI2'
-copyright = ''
+copyright = '2024, Patryk Orzechowski, Tomasz Kościółek'
 author = 'Patryk Orzechowski, Tomasz Kościółek'
 release = '0.0.1'
 
