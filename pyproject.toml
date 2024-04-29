@@ -1,0 +1,88 @@
+[project]
+name = "deepFRI2"
+dynamic = ["version"]
+description = "deepFRI2: Structure-based protein function prediction using graph convolutional networks"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+keywords = ["data science", "protein", "bioinformatics"]
+authors = [
+  {name = "Patryk Orzechowski", email = "patryk@upenn.edu"}, 
+  {name = "Tomasz Kościółek", email = "t.kosciolek@sanoscience.org"}
+]
+maintainers = [
+  {name = "Patryk Orzechowski", email = "patryk@upenn.edu"}, 
+  {name = "Tomasz Kościółek", email = "t.kosciolek@sanoscience.org"}
+]
+classifiers=[
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest ~= 7.2",
+  "pytest-cov",
+  "pytest-mock",
+  "flake8",
+  "black",
+  "responses",
+]
+
+[project.urls]
+homepage = "https://github.com/Tomasz-Lab/deepFRI2/"
+documentation = "https://github.com/Tomasz-Lab/deepFRI2/blob/main/README.md"
+repository = "https://github.com/Tomasz-Lab/deepFRI2/"
+changelog = "https://github.com/Tomasz-Lab/deepFRI2/blob/main/CHANGELOG.md"
+
+[tool.black]
+line-length = 99
+target-version = ['py312']
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | docs
+)/
+'''
+
+[tool.setuptools.packages.find]
+where = ["src", "config"]
+
+[tool.setuptools.package-data]
+"*" = ["*.ini", "*.txt"]
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_file = "src/deepFRI2/_version.py"
+
+[tool.pytest.ini_options]
+addopts = "-ra -q"
+testpaths = [
+  "tests",
+]
+pythonpath = [
+  ".", "src",
+]
