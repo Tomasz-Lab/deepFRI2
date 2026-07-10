@@ -1,0 +1,32 @@
+# Conda environment for deepFRI2 inference on GPU (recommended).
+#
+# Pins the exact package versions used to validate the released checkpoints so that
+# predictions are reproducible (in particular the conda-forge CUDA 12.6 build of
+# PyTorch 2.5.1). Requires an NVIDIA GPU with a driver supporting CUDA 12.6.
+# For a machine without a GPU, use environment-cpu.yml instead. Create it with:
+#
+#     conda env create -f environment-gpu.yml
+#     conda activate deepfri2
+#
+# (conda >= 23.10 uses the fast libmamba solver by default; `mamba env create` also works.)
+name: deepfri2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.8
+  # GPU build (conda-forge, CUDA 12.6). This is the "2.5.1.post306" build used for validation.
+  - pytorch=2.5.1=cuda126*
+  - cuda-version=12.6
+  - numpy=1.26.4
+  - pandas=2.2.3
+  - scipy=1.14.1
+  - transformers=4.48.0
+  - huggingface_hub=0.27.1
+  - tokenizers=0.21.0
+  - safetensors=0.5.2
+  - biopython=1.85
+  - tqdm=4.67.1
+  - pip
+  # fastobo (GO .obo parsing only; installed from PyPI wheels for cross-platform consistency).
+  - pip:
+      - fastobo==0.12.3
