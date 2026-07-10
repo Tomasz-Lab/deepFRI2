@@ -1,0 +1,31 @@
+# Conda environment for deepFRI2 inference on CPU (no GPU required).
+#
+# Same pinned versions as environment-gpu.yml but with the CPU build of PyTorch, so it
+# installs on any machine (smaller download, no CUDA). Intended for small runs; CPU
+# inference is much slower than GPU. Create it with:
+#
+#     conda env create -f environment-cpu.yml
+#     conda activate deepfri2
+#
+# Note: CPU results match the validated GPU results to ~6 decimal places (identical GO
+# terms and ranking); tiny float differences are expected between CPU and GPU.
+name: deepfri2_cpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.8
+  # CPU build (conda-forge). No CUDA libraries are pulled in.
+  - pytorch=2.5.1=cpu*
+  - numpy=1.26.4
+  - pandas=2.2.3
+  - scipy=1.14.1
+  - transformers=4.48.0
+  - huggingface_hub=0.27.1
+  - tokenizers=0.21.0
+  - safetensors=0.5.2
+  - biopython=1.85
+  - tqdm=4.67.1
+  - pip
+  # fastobo (GO .obo parsing only; not on conda for osx-arm64, so install from PyPI wheels).
+  - pip:
+      - fastobo==0.12.3

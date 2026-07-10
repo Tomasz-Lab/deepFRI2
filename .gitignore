@@ -1,0 +1,23 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ESM-2 weights (~2.5 GB) — fetch with `python download_esm.py`, do not commit.
+# The rest of params/ (DeepFRI2 head checkpoints, labels, GO obo) is tracked.
+params/esm2_t33_650M_UR50D/
+
+# Inference outputs
+results/
+
+# OS / editor
+.DS_Store
+*.swp
