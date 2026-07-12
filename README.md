@@ -1,5 +1,11 @@
 # deepFRI2
 
+[![GitHub](https://img.shields.io/badge/source-GitHub-303030.svg?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg?style=flat-square&logo=python)](https://www.python.org/)
+[![embeddings](https://img.shields.io/badge/embeddings-ESM-4caf50?style=flat-square)](https://github.com/facebookresearch/esm)
+[![License](https://img.shields.io/github/license/Tomasz-Lab/deepFRI2?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2/blob/main/LICENSE)
+[![Issues](https://img.shields.io/github/issues/Tomasz-Lab/deepFRI2?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2/issues)
+
 deepFRI2 is an upgraded version of the well-established [deepFRI](https://www.nature.com/articles/s41467-021-23303-9) (*Deep Functional Residue Identification*) framework for predicting protein function using [Gene Ontology](https://geneontology.org/) (GO) terms and [Enzyme Commission](https://enzyme.expasy.org/) (EC) numbers.
 
 Like its predecessor, deepFRI2 operates in two complementary modes: sequence-based and sequence–structure-based. This dual approach enables robust functional inference in metagenomic settings — where protein structures are often unavailable — as well as structure-informed functional annotation when structural information is available.
