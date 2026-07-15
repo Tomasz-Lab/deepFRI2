@@ -18,6 +18,10 @@ Inputs
     --batch_size / -b : proteins per inference batch (default: 32).
     --threshold  / -t : keep GO terms with score >= this in the summary (default: 0.1).
     --top_k      / -k : max GO terms per protein in the summary (default: all selected).
+    --prop       / -p : propagate scores up the GO hierarchy (default: off). When set, also
+                        writes the preds_propagated/ folder and adds the propagated columns
+                        (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob,
+                        struct_prop_prob, seq_prop_prob) to the summary.
     --verbose    / -v : enable debug logging (e.g. per-checkpoint weight-load report).
 
 Output (under <output_dir>; same as inference.ipynb)
@@ -25,9 +29,10 @@ Output (under <output_dir>; same as inference.ipynb)
     preds/<protein>__<ontology>.csv            : all GO terms with raw fusion / structure /
                                                  sequence probabilities and the gate.
     preds_propagated/<protein>__<ontology>.csv : all GO terms with hierarchically-propagated
-                                                 source terms and probabilities.
+                                                 source terms and probabilities (only with --prop).
     prediction_summary.csv                     : thresholded / top-k predictions per protein
-                                                 across all ontologies (raw + propagated).
+                                                 across all ontologies (raw, plus propagated
+                                                 columns only with --prop).
     log.txt                                    : run log.
 
 ESM weights must be present locally (run ``src/deepFRI2/download_esm.py`` once); deepFRI2
@@ -182,13 +187,17 @@ def resolve_file_names(input_dir, ids_file):
 
 def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_model,
                   device, go_terms_mappings, descendant_indices_by_ontology, go_name_map,
-                  batch_size, threshold, top_k):
+                  batch_size, threshold, top_k, prop=False):
     """Run all-ontology inference and write the same outputs as inference.ipynb.
 
     Produces, under ``output_dir``:
     - ``preds/<protein>__<ontology>.csv``            (raw fusion / structure / sequence probs + gate)
-    - ``preds_propagated/<protein>__<ontology>.csv`` (hierarchically-propagated terms + probs)
     - ``prediction_summary.csv``                     (thresholded / top-k summary across ontologies)
+
+    When ``prop`` is True, GO-hierarchy propagation is run as well, which additionally produces:
+    - ``preds_propagated/<protein>__<ontology>.csv`` (hierarchically-propagated terms + probs)
+    - the propagated columns (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob,
+      struct_prop_prob, seq_prop_prob) in ``prediction_summary.csv``.
     """
     from utils import (
         build_all_prediction_table,
@@ -202,9 +211,10 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
     output_dir = Path(output_dir)
     preds_dir = output_dir / "preds"
-    preds_propagated_dir = output_dir / "preds_propagated"
     preds_dir.mkdir(parents=True, exist_ok=True)
-    preds_propagated_dir.mkdir(parents=True, exist_ok=True)
+    preds_propagated_dir = output_dir / "preds_propagated"
+    if prop:
+        preds_propagated_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "prediction_summary.csv"
     summary_path.unlink(missing_ok=True)
     header_written = False
@@ -235,7 +245,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
         for ontology in ONTOLOGIES:
             mapping = go_terms_mappings[ontology]
-            descendant_indices = descendant_indices_by_ontology[ontology]
+            descendant_indices = descendant_indices_by_ontology[ontology] if prop else None
             inference_start = time.perf_counter()
             preds, preds_struct, preds_seq, gate = inference_for_batch(
                 models[ontology],
@@ -261,19 +271,23 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                     batch_ids, preds, preds_struct, preds_seq, gate
                 )
             ]
-            propagated_batch_records = [
-                propagate_prediction_record(record, descendant_indices)
-                for record in batch_records
-            ]
+            # GO-hierarchy propagation is only computed when requested (--prop).
+            propagated_batch_records = (
+                [propagate_prediction_record(record, descendant_indices) for record in batch_records]
+                if prop
+                else None
+            )
 
-            # Per-protein raw and propagated tables (fusion / structure / sequence branches).
-            for record, propagated in zip(batch_records, propagated_batch_records):
+            # Per-protein raw table (fusion / structure / sequence branches), plus the
+            # propagated table when propagation is enabled.
+            for i, record in enumerate(batch_records):
                 build_all_prediction_table([record], mapping).to_csv(
                     preds_dir / f"{record['protein_id']}__{ontology}.csv", index=False
                 )
-                build_propagated_prediction_table([propagated], mapping).to_csv(
-                    preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
-                )
+                if prop:
+                    build_propagated_prediction_table([propagated_batch_records[i]], mapping).to_csv(
+                        preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
+                    )
 
             # Thresholded / top-k summary, appended across ontologies and batches.
             summary, _ = build_prediction_summary(
@@ -290,7 +304,10 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
     log_timing("Inference time", inference_elapsed, total_proteins, "protein")
     log_timing("Total time", time.perf_counter() - start, total_proteins, "protein")
-    logger.info(f"Wrote per-protein tables to {preds_dir} and {preds_propagated_dir}")
+    if prop:
+        logger.info(f"Wrote per-protein tables to {preds_dir} and {preds_propagated_dir}")
+    else:
+        logger.info(f"Wrote per-protein tables to {preds_dir}")
     logger.info(f"Wrote summary to {summary_path} for {total_proteins} protein(s)")
     return summary_path
 
@@ -318,6 +335,9 @@ def parse_args(argv=None):
                              f"(default: {DEFAULT_THRESHOLD}).")
     parser.add_argument("--top_k", "-k", type=int, default=DEFAULT_TOP_K,
                         help="Max GO terms per protein in the summary (default: all selected).")
+    parser.add_argument("--prop", "-p", action="store_true",
+                        help="Propagate scores up the GO hierarchy (default: off); also writes "
+                             "the preds_propagated/ folder and the propagated summary columns.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging (e.g. per-checkpoint weight-load report).")
     return parser.parse_args(argv)
@@ -361,6 +381,7 @@ def main(argv=None):
     logger.info(f"Batch size      : {args.batch_size}")
     logger.info(f"Threshold       : {args.threshold}")
     logger.info(f"Top k           : {top_k}")
+    logger.info(f"Propagate       : {args.prop}")
     logger.info(f"Verbose         : {args.verbose}")
     logger.info(f"Device          : {device}")
 
@@ -371,10 +392,15 @@ def main(argv=None):
     models = load_models(device, num_labels_by_ontology, PARAMS_DIR)
 
     go_graph, go_name_map = load_go_name_map(PARAMS_DIR / f"go_{GO_VERSION}.obo")
-    descendant_indices_by_ontology = {
-        ontology: build_go_descendant_indices(mapping, go_graph)
-        for ontology, mapping in go_terms_mappings.items()
-    }
+    # GO-hierarchy descendant indices are only needed for propagation (--prop).
+    descendant_indices_by_ontology = (
+        {
+            ontology: build_go_descendant_indices(mapping, go_graph)
+            for ontology, mapping in go_terms_mappings.items()
+        }
+        if args.prop
+        else None
+    )
 
     file_names = resolve_file_names(input_dir, args.ids_file)
 
@@ -382,6 +408,7 @@ def main(argv=None):
         input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
         go_terms_mappings, descendant_indices_by_ontology, go_name_map,
         batch_size=args.batch_size, threshold=args.threshold, top_k=args.top_k,
+        prop=args.prop,
     )
     logger.info("Done.")
 

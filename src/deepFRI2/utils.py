@@ -1046,8 +1046,11 @@ def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, t
     """Thresholded / top-k prediction summary across branches (fusion, structure, sequence).
 
     For each protein, selects GO terms whose fusion probability passes ``threshold`` (or the
-    top ranked terms), and reports raw + propagated probabilities per branch. Returns the
-    summary DataFrame and ``{protein_id: [selected GO ids]}``.
+    top ranked terms), and reports raw probabilities per branch. When ``propagated_records``
+    is provided, the propagated columns (prop_go_id, struct_prop_go_id, seq_prop_go_id,
+    pred_prop_prob, struct_prop_prob, seq_prop_prob) are added as well; when it is None those
+    columns are omitted entirely. Returns the summary DataFrame and
+    ``{protein_id: [selected GO ids]}``.
     """
     rows = []
     goterms = {}
@@ -1092,27 +1095,29 @@ def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, t
         goterms[record["protein_id"]] = [_resolve_go_term(go_terms_mapping, int(i)) for i in idxs]
         for rank, idx in enumerate(idxs, start=1):
             go_term = _resolve_go_term(go_terms_mapping, int(idx))
-            prop_go_term = None if prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(prop_source_idx[int(idx)]))
-            struct_prop_go_term = None if struct_prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(struct_prop_source_idx[int(idx)]))
-            seq_prop_go_term = None if seq_prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(seq_prop_source_idx[int(idx)]))
-            rows.append(
-                {
-                    "protein_id": record["protein_id"],
-                    "rank": rank,
-                    "selection": selection,
-                    "go_term": go_term,
-                    "go_term_name": _resolve_go_name(go_term, go_name_map),
-                    "term_idx": int(idx),
-                    "pred_prob": float(probs[int(idx)]),
-                    "struct_prob": float(struct_probs[int(idx)]),
-                    "seq_prob": float(seq_probs[int(idx)]),
-                    "gate": float(gate_probs[int(idx)]) if gate_probs is not None else None,
-                    "prop_go_id": prop_go_term,
-                    "struct_prop_go_id": struct_prop_go_term,
-                    "seq_prop_go_id": seq_prop_go_term,
-                    "pred_prop_prob": None if prop_probs is None else float(prop_probs[int(idx)]),
-                    "struct_prop_prob": None if struct_prop_probs is None else float(struct_prop_probs[int(idx)]),
-                    "seq_prop_prob": None if seq_prop_probs is None else float(seq_prop_probs[int(idx)]),
-                }
-            )
+            row = {
+                "protein_id": record["protein_id"],
+                "rank": rank,
+                "selection": selection,
+                "go_term": go_term,
+                "go_term_name": _resolve_go_name(go_term, go_name_map),
+                "term_idx": int(idx),
+                "pred_prob": float(probs[int(idx)]),
+                "struct_prob": float(struct_probs[int(idx)]),
+                "seq_prob": float(seq_probs[int(idx)]),
+                "gate": float(gate_probs[int(idx)]) if gate_probs is not None else None,
+            }
+            # Propagated columns are included only when propagation data is available.
+            if propagated_record is not None:
+                row.update(
+                    {
+                        "prop_go_id": None if prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(prop_source_idx[int(idx)])),
+                        "struct_prop_go_id": None if struct_prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(struct_prop_source_idx[int(idx)])),
+                        "seq_prop_go_id": None if seq_prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(seq_prop_source_idx[int(idx)])),
+                        "pred_prop_prob": None if prop_probs is None else float(prop_probs[int(idx)]),
+                        "struct_prop_prob": None if struct_prop_probs is None else float(struct_prop_probs[int(idx)]),
+                        "seq_prop_prob": None if seq_prop_probs is None else float(seq_prop_probs[int(idx)]),
+                    }
+                )
+            rows.append(row)
     return pd.DataFrame(rows), goterms

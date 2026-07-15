@@ -60,6 +60,7 @@ Options (run `python src/deepFRI2/deepfri2.py --help` for the full list):
 | `-b`, `--batch_size` | Proteins per inference batch (default: `32`). |
 | `-t`, `--threshold` | Keep GO terms scoring ≥ this in the summary (default: `0.1`). |
 | `-k`, `--top_k` | Maximum GO terms per protein in the summary (default: all selected). |
+| `-p`, `--prop` | Propagate scores up the GO hierarchy (default: off). Adds the `preds_propagated/` folder and the propagated columns to the summary. |
 | `-v`, `--verbose` | Enable debug logging. |
 
 Example — run a subset of structures with a stricter threshold:
@@ -74,12 +75,12 @@ python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.2
 
 Predictions are written under the output folder (all three ontologies — MF, CC, BP):
 
-- `prediction_summary.csv` — top predicted GO terms per protein, with raw and GO-hierarchy-propagated scores for the fusion, structure, and sequence branches.
+- `prediction_summary.csv` — top predicted GO terms per protein, with raw scores for the fusion, structure, and sequence branches (and GO-hierarchy-propagated scores when `--prop` is set).
 - `preds/<protein>__<ontology>.csv` — full per-term probabilities (fusion / structure / sequence + gate).
-- `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation.
+- `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation (only when `--prop` is set).
 - `log.txt` — the run log.
 
-For a quick overview of predicted functions, please take a look at `pred_prob` (raw probabilities) or `pred_prop_prob` (consistent probabilities i.e., the more general the term, the higher its probability) columns in `prediction_summary.csv`. In some cases, it is also useful to check purely structure- and sequence-based outputs (see `struct_prob`, `seq_prob` etc.). For a downstream analysis, you may wish to check the full output in `preds` and `preds_propagated` folders.
+For a quick overview of predicted functions, please take a look at the `pred_prob` (raw probabilities) column in `prediction_summary.csv` — or, when you run with `--prop`, the `pred_prop_prob` column (consistent probabilities i.e., the more general the term, the higher its probability). In some cases, it is also useful to check purely structure- and sequence-based outputs (see `struct_prob`, `seq_prob` etc.). For a downstream analysis, you may wish to check the full output in `preds` (and, with `--prop`, `preds_propagated`) folders.
 
 ### Runtime
 
