@@ -160,7 +160,12 @@ def resolve_file_names(input_dir, ids_file):
     """
     if ids_file is None:
         return None
-    entries = [line.strip() for line in Path(ids_file).read_text().splitlines() if line.strip()]
+    ids_file = Path(ids_file)
+    if not ids_file.exists():
+        _fatal(f"IDs file does not exist: {ids_file}")
+    entries = [line.strip() for line in ids_file.read_text().splitlines() if line.strip()]
+    if not entries:
+        _fatal(f"IDs file is empty: {ids_file}")
     files = sorted(Path(input_dir).glob("*.cif")) + sorted(Path(input_dir).glob("*.pdb"))
     by_name = {f.name: f.name for f in files}
     by_stem = {}
@@ -178,7 +183,36 @@ def resolve_file_names(input_dir, ids_file):
     if missing:
         preview = ", ".join(missing[:5]) + (", ..." if len(missing) > 5 else "")
         logger.warning(f"{len(missing)} id(s) from {ids_file} not found in {input_dir}: {preview}")
+    if not resolved:
+        _fatal(f"No id(s) from {ids_file} matched any structure in {input_dir}")
     return resolved
+
+
+def _fatal(message):
+    """Log an ERROR and terminate the run: these are cases where the model should not run at all."""
+    logger.error(message)
+    raise SystemExit(1)
+
+
+def validate_input_dir(input_dir):
+    """Validate the input directory before any heavy work.
+
+    Logs an ERROR and terminates when there is nothing to run on (the directory is
+    missing, is not a directory, or holds no .cif/.pdb structures). Empty (zero-byte)
+    structure files are reported as a non-fatal warning, since other files may be fine.
+    """
+    input_dir = Path(input_dir)
+    if not input_dir.exists():
+        _fatal(f"Input dir does not exist: {input_dir}")
+    if not input_dir.is_dir():
+        _fatal(f"Input path is not a directory: {input_dir}")
+    structures = sorted(input_dir.glob("*.cif")) + sorted(input_dir.glob("*.pdb"))
+    if not structures:
+        _fatal(f"Input dir contains no .cif/.pdb structures: {input_dir}")
+    empty = [p.name for p in structures if p.stat().st_size == 0]
+    if empty:
+        preview = ", ".join(empty[:5]) + (", ..." if len(empty) > 5 else "")
+        logger.warning(f"{len(empty)} empty (zero-byte) structure file(s) in {input_dir}: {preview}")
 
 
 # =========
@@ -385,6 +419,11 @@ def main(argv=None):
     logger.info(f"Verbose         : {args.verbose}")
     logger.info(f"Device          : {device}")
 
+    # Validate inputs before any heavy work: on fatal problems (missing/empty input dir
+    # or ids file, or no matching ids) this logs an ERROR and terminates without running.
+    validate_input_dir(input_dir)
+    file_names = resolve_file_names(input_dir, args.ids_file)
+
     go_terms_mappings = load_go_terms_mappings(PARAMS_DIR)
     num_labels_by_ontology = {ont: len(m) for ont, m in go_terms_mappings.items()}
 
@@ -401,8 +440,6 @@ def main(argv=None):
         if args.prop
         else None
     )
-
-    file_names = resolve_file_names(input_dir, args.ids_file)
 
     run_inference(
         input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
