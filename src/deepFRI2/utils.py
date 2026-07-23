@@ -592,7 +592,8 @@ def generate_embeddings_for_list(sequences, tokenizer, model, device, show_progr
         for seq in iterator:
             input_ = tokenizer(seq, return_tensors="pt")
             input_ = {k: v.to(device) for k, v in input_.items()}
-            output = model(**input_, output_hidden_states=True)
+            with torch.inference_mode():
+                output = model(**input_, output_hidden_states=True)
             embedding = output.hidden_states[-1]
             embedding = embedding[0, :].to("cpu").to(torch.float32).numpy()
             embeddings.append(embedding)
@@ -1041,16 +1042,42 @@ def build_propagated_prediction_table(protein_records, go_terms_mapping):
     return pd.DataFrame(rows)
 
 
+def _threshold_pair(threshold):
+    """Normalize a threshold spec to a ``(fusion_and_sequence, structure)`` float pair.
+
+    Accepts a single float (applied to all branches) or a 1/2-length tuple/list. The two-value
+    form applies the first threshold to the fusion and sequence branches and the second to the
+    structure branch (the structural prober is trained with a different loss and tends to output
+    higher probabilities on average).
+    """
+    if isinstance(threshold, (tuple, list)):
+        if len(threshold) == 1:
+            return float(threshold[0]), float(threshold[0])
+        return float(threshold[0]), float(threshold[1])
+    return float(threshold), float(threshold)
+
+
+def _branch_mask(probs, t):
+    """Boolean keep-mask for one branch. ``t <= 0`` keeps everything, ``t >= 1`` keeps nothing."""
+    if t <= 0.0:
+        return np.ones(len(probs), dtype=bool)
+    if t >= 1.0:
+        return np.zeros(len(probs), dtype=bool)
+    return probs >= t
+
+
 def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, top_k=10,
                              go_name_map=None, propagated_records=None):
     """Thresholded / top-k prediction summary across branches (fusion, structure, sequence).
 
-    For each protein, selects GO terms whose fusion probability passes ``threshold`` (or the
-    top ranked terms), and reports raw probabilities per branch. When ``propagated_records``
-    is provided, the propagated columns (prop_go_id, struct_prop_go_id, seq_prop_go_id,
-    pred_prop_prob, struct_prop_prob, seq_prop_prob) are added as well; when it is None those
-    columns are omitted entirely. Returns the summary DataFrame and
-    ``{protein_id: [selected GO ids]}``.
+    ``threshold`` is either a single float (applied to all branches) or a ``(fusion_and_sequence,
+    structure)`` pair. For each protein, a GO term is kept when *any* branch probability passes
+    its threshold. A threshold of 0 keeps every term, and a threshold of 1 keeps none. Selected
+    terms are sorted by fusion probability, then sequence, then structure (all descending).
+    Reports raw probabilities per branch. When ``propagated_records`` is provided, the propagated
+    columns (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob, struct_prop_prob,
+    seq_prop_prob) are added as well; when it is None those columns are omitted entirely. Returns
+    the summary DataFrame and ``{protein_id: [selected GO ids]}``.
     """
     rows = []
     goterms = {}
@@ -1070,24 +1097,26 @@ def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, t
         struct_prop_source_idx = None if propagated_record is None or propagated_record.get("struct_prop_source_idx") is None else np.asarray(propagated_record["struct_prop_source_idx"], dtype=np.int64)
         seq_prop_source_idx = None if propagated_record is None or propagated_record.get("seq_prop_source_idx") is None else np.asarray(propagated_record["seq_prop_source_idx"], dtype=np.int64)
 
+        # Keep a term if any branch passes its threshold. Fusion and sequence share the first
+        # threshold; structure uses the second (see _threshold_pair).
         if threshold is None:
-            idxs = np.argsort(probs)[::-1]
-            selection = "all_terms" if top_k is None else "topk_only"
+            idxs = np.arange(len(probs), dtype=np.int64)
         else:
-            idxs = np.where(probs >= float(threshold))[0]
-            if idxs.size == 0:
-                idxs = np.argsort(probs)[::-1]
-                selection = "topk_fallback" if top_k is not None else "fallback_all_terms"
-            else:
-                idxs = idxs[np.argsort(probs[idxs])[::-1]]
-                selection = "threshold"
+            t_fs, t_struct = _threshold_pair(threshold)
+            mask = _branch_mask(probs, t_fs) | _branch_mask(seq_probs, t_fs) | _branch_mask(struct_probs, t_struct)
+            idxs = np.where(mask)[0]
 
         # Drop ontology root terms (molecular_function / cellular_component / biological_process):
-        # they are trivially predicted and should not occupy top-k slots in the summary.
+        # they are trivially predicted and should not occupy slots in the summary.
         idxs = np.array(
             [i for i in idxs if _resolve_go_term(go_terms_mapping, int(i)) not in ROOT_GO_IDS],
             dtype=np.int64,
         )
+
+        # Sort selected terms by fusion probability, then sequence, then structure (all desc).
+        if idxs.size:
+            order = np.lexsort((struct_probs[idxs], seq_probs[idxs], probs[idxs]))[::-1]
+            idxs = idxs[order]
 
         if top_k is not None:
             idxs = idxs[: int(top_k)]
@@ -1098,10 +1127,10 @@ def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, t
             row = {
                 "protein_id": record["protein_id"],
                 "rank": rank,
-                "selection": selection,
+                # "selection": selection,
                 "go_term": go_term,
                 "go_term_name": _resolve_go_name(go_term, go_name_map),
-                "term_idx": int(idx),
+                # "term_idx": int(idx),
                 "pred_prob": float(probs[int(idx)]),
                 "struct_prob": float(struct_probs[int(idx)]),
                 "seq_prob": float(seq_probs[int(idx)]),

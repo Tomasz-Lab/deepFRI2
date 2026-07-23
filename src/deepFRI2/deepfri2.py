@@ -16,7 +16,9 @@ Inputs
                         run (e.g. ``abCD.cif`` or just ``abCD``); if omitted, every
                         structure in ``--input_dir`` is processed.
     --batch_size / -b : proteins per inference batch (default: 32).
-    --threshold  / -t : keep GO terms with score >= this in the summary (default: 0.1).
+    --threshold  / -t : one float (applied to all branches) or two comma-separated floats
+                        (fusion/sequence, structure) for keeping GO terms in the summary
+                        (default: 0.1,0.2). 0 keeps everything; 1 keeps nothing.
     --top_k      / -k : max GO terms per protein in the summary (default: all selected).
     --prop       / -p : propagate scores up the GO hierarchy (default: off). When set, also
                         writes the preds_propagated/ folder and adds the propagated columns
@@ -70,7 +72,9 @@ PARAMS_DIR = REPO_ROOT / "params"
 
 # Defaults for the tunable inference options (overridable on the command line).
 DEFAULT_BATCH_SIZE = 32
-DEFAULT_THRESHOLD = 0.1
+# Threshold is a (fusion_and_sequence, structure) pair; the structural prober is trained with a
+# different loss and outputs higher probabilities on average, hence the higher default for it.
+DEFAULT_THRESHOLD = (0.1, 0.2)
 DEFAULT_TOP_K = None
 
 BANNER = r"""
@@ -250,8 +254,9 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
     if prop:
         preds_propagated_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "prediction_summary.csv"
-    summary_path.unlink(missing_ok=True)
-    header_written = False
+    # Summary rows are accumulated per ontology and written once at the end, so the file
+    # is grouped by ontology (MF, then CC, then BP) regardless of batch/ontology iteration.
+    summary_frames = {ontology: [] for ontology in ONTOLOGIES}
 
     total_proteins = 0
     inference_elapsed = 0.0  # model forward-pass time only (excludes parsing/embedding/IO)
@@ -323,7 +328,8 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                         preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
                     )
 
-            # Thresholded / top-k summary, appended across ontologies and batches.
+            # Summary rows: keep a term if any branch (fusion / structure / sequence)
+            # passes the threshold. Accumulated per ontology, written once at the end.
             summary, _ = build_prediction_summary(
                 batch_records,
                 mapping,
@@ -333,8 +339,13 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 propagated_records=propagated_batch_records,
             )
             summary.insert(0, "ontology", ontology)
-            summary.to_csv(summary_path, mode="a", header=not header_written, index=False)
-            header_written = True
+            summary_frames[ontology].append(summary)
+
+    # Write the full summary once, grouped by ontology in MF -> CC -> BP order.
+    import pandas as pd
+    ordered_frames = [frame for ontology in ONTOLOGIES for frame in summary_frames[ontology]]
+    full_summary = pd.concat(ordered_frames, ignore_index=True) if ordered_frames else pd.DataFrame()
+    full_summary.to_csv(summary_path, index=False)
 
     log_timing("Inference time", inference_elapsed, total_proteins, "protein")
     log_timing("Total time", time.perf_counter() - start, total_proteins, "protein")
@@ -350,6 +361,27 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 # CLI
 # ===
 
+def parse_threshold(value):
+    """Parse ``--threshold`` into a ``(fusion_and_sequence, structure)`` float pair.
+
+    Accepts one float (applied to all branches, so both entries are equal) or two comma-separated
+    floats (first for fusion/sequence, second for structure). Values must lie in [0, 1].
+    """
+    parts = [part.strip() for part in str(value).split(",")]
+    if len(parts) not in (1, 2):
+        raise argparse.ArgumentTypeError(
+            "--threshold must be one float or two comma-separated floats, e.g. '0.1' or '0.1,0.2'"
+        )
+    try:
+        nums = [float(part) for part in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--threshold values must be floats, got: {value!r}")
+    for num in nums:
+        if not (0.0 <= num <= 1.0):
+            raise argparse.ArgumentTypeError(f"--threshold values must be in [0, 1], got: {num}")
+    return (nums[0], nums[0]) if len(nums) == 1 else (nums[0], nums[1])
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="deepFRI2 inference: predict GO terms for protein structures.",
@@ -364,9 +396,12 @@ def parse_args(argv=None):
                              "e.g. 'abCD.cif' or 'abCD'); default: all files in input_dir.")
     parser.add_argument("--batch_size", "-b", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Proteins per inference batch (default: {DEFAULT_BATCH_SIZE}).")
-    parser.add_argument("--threshold", "-t", type=float, default=DEFAULT_THRESHOLD,
-                        help=f"Keep GO terms with score >= this in the summary "
-                             f"(default: {DEFAULT_THRESHOLD}).")
+    parser.add_argument("--threshold", "-t", type=parse_threshold, default=DEFAULT_THRESHOLD,
+                        metavar="T | T_fs,T_struct",
+                        help="Keep a GO term if any branch score >= threshold. One float applies "
+                             "to all branches; two comma-separated floats apply to fusion/sequence "
+                             "and structure respectively. 0 keeps everything, 1 keeps nothing "
+                             "(default: 0.1,0.2).")
     parser.add_argument("--top_k", "-k", type=int, default=DEFAULT_TOP_K,
                         help="Max GO terms per protein in the summary (default: all selected).")
     parser.add_argument("--prop", "-p", action="store_true",
@@ -408,12 +443,13 @@ def main(argv=None):
     # Report the full run configuration up front for transparency.
     ids_file = args.ids_file if args.ids_file is not None else "None (all structures in input dir)"
     top_k = args.top_k if args.top_k is not None else "all"
+    threshold_fs, threshold_struct = args.threshold
     logger.info(f"deepFRI2 version : {config_version()}")
     logger.info(f"Input dir       : {input_dir}")
     logger.info(f"Output dir      : {output_dir}")
     logger.info(f"IDs file        : {ids_file}")
     logger.info(f"Batch size      : {args.batch_size}")
-    logger.info(f"Threshold       : {args.threshold}")
+    logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
     logger.info(f"Top k           : {top_k}")
     logger.info(f"Propagate       : {args.prop}")
     logger.info(f"Verbose         : {args.verbose}")
