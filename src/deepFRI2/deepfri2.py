@@ -260,10 +260,12 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
     if prop:
         preds_propagated_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "prediction_summary.csv"
-    # Summary rows are accumulated and written once at the end, sorted protein-major: proteins in
-    # processing order, with aspects grouped MF -> CC -> BP within each protein.
-    summary_parts = []
-    protein_order = []
+    # The summary is appended one batch at a time (never held whole in memory). Within each batch
+    # rows are ordered protein-major (proteins in batch order, aspects MF -> CC -> BP); batches are
+    # processed in order, so the file ends up protein-major overall.
+    import pandas as pd
+    summary_path.unlink(missing_ok=True)
+    header_written = False
 
     total_proteins = 0
     inference_elapsed = 0.0  # model forward-pass time only (excludes parsing/embedding/IO)
@@ -288,8 +290,8 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
         distograms_batch = distograms_batch.to(device)
         masks_batch = masks_batch.to(device)
         total_proteins += len(batch_ids)
-        protein_order.extend(batch_ids)
 
+        batch_summaries = []
         for ontology in aspects:
             mapping = go_terms_mappings[ontology]
             descendant_indices = descendant_indices_by_ontology[ontology] if prop else None
@@ -337,7 +339,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                     )
 
             # Summary rows: keep a term if any branch (fusion / structure / sequence)
-            # passes the threshold. Accumulated per ontology, written once at the end.
+            # passes the threshold. Collected per aspect, written out below per batch.
             summary, _ = build_prediction_summary(
                 batch_records,
                 mapping,
@@ -347,28 +349,31 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 propagated_records=propagated_batch_records,
             )
             summary.insert(0, "ontology", ontology)
-            summary_parts.append(summary)
+            batch_summaries.append(summary)
 
-    # Write the full summary once, sorted protein-major: proteins in processing order, with
-    # aspects grouped MF -> CC -> BP within each protein (rank order preserved within a group).
-    import pandas as pd
-    if summary_parts:
-        full_summary = pd.concat(summary_parts, ignore_index=True)
-        protein_rank = {protein_id: order for order, protein_id in enumerate(protein_order)}
-        aspect_rank = {ontology: order for order, ontology in enumerate(ONTOLOGIES)}
-        full_summary = (
-            full_summary
-            .assign(
-                _protein_rank=full_summary["protein_id"].map(protein_rank),
-                _aspect_rank=full_summary["ontology"].map(aspect_rank),
+        # Append this batch to the summary CSV, ordered protein-major (proteins in batch order,
+        # aspects MF -> CC -> BP). Only one batch is held in memory at a time.
+        batch_summaries = [frame for frame in batch_summaries if not frame.empty]
+        if batch_summaries:
+            batch_summary = pd.concat(batch_summaries, ignore_index=True)
+            protein_rank = {protein_id: order for order, protein_id in enumerate(batch_ids)}
+            aspect_rank = {ontology: order for order, ontology in enumerate(ONTOLOGIES)}
+            batch_summary = (
+                batch_summary
+                .assign(
+                    _protein_rank=batch_summary["protein_id"].map(protein_rank),
+                    _aspect_rank=batch_summary["ontology"].map(aspect_rank),
+                )
+                .sort_values(["_protein_rank", "_aspect_rank"], kind="stable")
+                .drop(columns=["_protein_rank", "_aspect_rank"])
             )
-            .sort_values(["_protein_rank", "_aspect_rank"], kind="stable")
-            .drop(columns=["_protein_rank", "_aspect_rank"])
-            .reset_index(drop=True)
-        )
-    else:
-        full_summary = pd.DataFrame()
-    full_summary.to_csv(summary_path, index=False)
+            batch_summary.to_csv(summary_path, mode="a", header=not header_written, index=False)
+            header_written = True
+
+    # Ensure the summary file exists even when no term passed the threshold (empty table),
+    # so it stays consistent with the "Wrote summary ..." log line below.
+    if not header_written:
+        summary_path.touch()
 
     log_timing("Inference time", inference_elapsed, total_proteins, "protein")
     log_timing("Total time", time.perf_counter() - start, total_proteins, "protein")
