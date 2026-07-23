@@ -377,7 +377,9 @@ def _atoms_from_pdb(pdb_file, atom_name):
         for line in handle:
             record = line[:6].strip()
             if record == "SEQRES":
-                for i in range(18, min(len(line), 70), 4):
+                # PDB SEQRES residue names occupy columns 20-22, 24-26, ... (1-based), i.e.
+                # 0-based index 19 onward in 4-char steps (3-char name + 1 space).
+                for i in range(19, min(len(line), 70), 4):
                     name = line[i : i + 3].strip()
                     if name:
                         seqres_tokens.append(name)
