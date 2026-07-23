@@ -57,6 +57,7 @@ Options (run `python src/deepFRI2/deepfri2.py --help` for the full list):
 | `-i`, `--input_dir` | Folder with `.cif` / `.pdb` structures. **(required)** |
 | `-o`, `--output_dir` | Folder for results (default: `<repo>/results`). |
 | `-f`, `--ids_file` | Text file listing structures to run, one per line (`abCD.cif` or just `abCD`); default: all files in the input folder. |
+| `-a`, `--aspect` | Comma-separated GO aspects (models) to run: any of `MF`, `CC`, `BP` (case-insensitive). Default: `mf,cc,bp`. |
 | `-b`, `--batch_size` | Proteins per inference batch (default: `32`). |
 | `-t`, `--threshold` | Keep a GO term in the summary if **any** model scores ≥ threshold. Either one float applied to all models (`0.1`) or two comma-separated floats applied to fusion/sequence and structure respectively (`0.1,0.2`). The structural prober is trained with a different loss and outputs higher probabilities on average, hence the higher default for it. `0` (or `0,0`) keeps everything; `1` (or `1,1`) keeps nothing. Default: `0.1,0.2`. |
 | `-k`, `--top_k` | Maximum GO terms per protein in the summary (default: all selected). |

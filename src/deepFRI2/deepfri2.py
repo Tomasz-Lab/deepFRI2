@@ -15,6 +15,8 @@ Inputs
     --ids_file   / -f : text file with one entry per line naming the structures to
                         run (e.g. ``abCD.cif`` or just ``abCD``); if omitted, every
                         structure in ``--input_dir`` is processed.
+    --aspect     / -a : comma-separated GO aspects (models) to run: any of MF, CC, BP
+                        (case-insensitive). Default: mf,cc,bp.
     --batch_size / -b : proteins per inference batch (default: 32).
     --threshold  / -t : one float (applied to all branches) or two comma-separated floats
                         (fusion/sequence, structure) for keeping GO terms in the summary
@@ -133,10 +135,11 @@ def load_esm(device, params_dir):
     return tokenizer, model
 
 
-def load_models(device, num_labels_by_ontology, params_dir):
-    """Build and load a deepFRI2 fusion model for every ontology."""
+def load_models(device, num_labels_by_ontology, params_dir, ontologies=None):
+    """Build and load a deepFRI2 fusion model for each requested ontology (default: all)."""
     from model import build_deepfri2_model
 
+    ontologies = list(ONTOLOGIES) if ontologies is None else list(ontologies)
     models = {
         ontology: build_deepfri2_model(
             ontology,
@@ -150,9 +153,9 @@ def load_models(device, num_labels_by_ontology, params_dir):
             num_diag=NUM_DIAG,
             num_anti=NUM_ANTI,
         )
-        for ontology in ONTOLOGIES
+        for ontology in ontologies
     }
-    logger.info(f"deepFRI2 models loaded: {', '.join(ONTOLOGIES)}")
+    logger.info(f"deepFRI2 models loaded: {', '.join(ontologies)}")
     return models
 
 
@@ -225,7 +228,7 @@ def validate_input_dir(input_dir):
 
 def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_model,
                   device, go_terms_mappings, descendant_indices_by_ontology, go_name_map,
-                  batch_size, threshold, top_k, prop=False):
+                  batch_size, threshold, top_k, prop=False, aspects=None):
     """Run all-ontology inference and write the same outputs as inference.ipynb.
 
     Produces, under ``output_dir``:
@@ -247,6 +250,9 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
         propagate_prediction_record,
     )
 
+    # Aspects (GO ontologies / models) to run, in canonical MF -> CC -> BP order.
+    aspects = list(ONTOLOGIES) if aspects is None else aspects
+
     output_dir = Path(output_dir)
     preds_dir = output_dir / "preds"
     preds_dir.mkdir(parents=True, exist_ok=True)
@@ -254,9 +260,10 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
     if prop:
         preds_propagated_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "prediction_summary.csv"
-    # Summary rows are accumulated per ontology and written once at the end, so the file
-    # is grouped by ontology (MF, then CC, then BP) regardless of batch/ontology iteration.
-    summary_frames = {ontology: [] for ontology in ONTOLOGIES}
+    # Summary rows are accumulated and written once at the end, sorted protein-major: proteins in
+    # processing order, with aspects grouped MF -> CC -> BP within each protein.
+    summary_parts = []
+    protein_order = []
 
     total_proteins = 0
     inference_elapsed = 0.0  # model forward-pass time only (excludes parsing/embedding/IO)
@@ -281,8 +288,9 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
         distograms_batch = distograms_batch.to(device)
         masks_batch = masks_batch.to(device)
         total_proteins += len(batch_ids)
+        protein_order.extend(batch_ids)
 
-        for ontology in ONTOLOGIES:
+        for ontology in aspects:
             mapping = go_terms_mappings[ontology]
             descendant_indices = descendant_indices_by_ontology[ontology] if prop else None
             inference_start = time.perf_counter()
@@ -339,12 +347,27 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 propagated_records=propagated_batch_records,
             )
             summary.insert(0, "ontology", ontology)
-            summary_frames[ontology].append(summary)
+            summary_parts.append(summary)
 
-    # Write the full summary once, grouped by ontology in MF -> CC -> BP order.
+    # Write the full summary once, sorted protein-major: proteins in processing order, with
+    # aspects grouped MF -> CC -> BP within each protein (rank order preserved within a group).
     import pandas as pd
-    ordered_frames = [frame for ontology in ONTOLOGIES for frame in summary_frames[ontology]]
-    full_summary = pd.concat(ordered_frames, ignore_index=True) if ordered_frames else pd.DataFrame()
+    if summary_parts:
+        full_summary = pd.concat(summary_parts, ignore_index=True)
+        protein_rank = {protein_id: order for order, protein_id in enumerate(protein_order)}
+        aspect_rank = {ontology: order for order, ontology in enumerate(ONTOLOGIES)}
+        full_summary = (
+            full_summary
+            .assign(
+                _protein_rank=full_summary["protein_id"].map(protein_rank),
+                _aspect_rank=full_summary["ontology"].map(aspect_rank),
+            )
+            .sort_values(["_protein_rank", "_aspect_rank"], kind="stable")
+            .drop(columns=["_protein_rank", "_aspect_rank"])
+            .reset_index(drop=True)
+        )
+    else:
+        full_summary = pd.DataFrame()
     full_summary.to_csv(summary_path, index=False)
 
     log_timing("Inference time", inference_elapsed, total_proteins, "protein")
@@ -382,6 +405,26 @@ def parse_threshold(value):
     return (nums[0], nums[0]) if len(nums) == 1 else (nums[0], nums[1])
 
 
+def parse_aspect(value):
+    """Parse ``--aspect`` into a list of GO aspects (models) to run, in canonical order.
+
+    Accepts a comma-separated list of any of MF, CC, BP (case-insensitive). Duplicates are
+    dropped and the result is returned in the canonical MF -> CC -> BP order (config ``ONTOLOGIES``).
+    """
+    valid = {ontology.upper(): ontology for ontology in ONTOLOGIES}
+    parts = [part.strip().upper() for part in str(value).split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError(f"--aspect must list at least one of: {', '.join(ONTOLOGIES)}")
+    invalid = [part for part in parts if part not in valid]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"--aspect values must be from {{{', '.join(ONTOLOGIES)}}} (case-insensitive), "
+            f"got: {', '.join(invalid)}"
+        )
+    selected = {valid[part] for part in parts}
+    return [ontology for ontology in ONTOLOGIES if ontology in selected]
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="deepFRI2 inference: predict GO terms for protein structures.",
@@ -394,6 +437,10 @@ def parse_args(argv=None):
     parser.add_argument("--ids_file", "-f", type=Path, default=None,
                         help="Text file listing structures to run (one per line, "
                              "e.g. 'abCD.cif' or 'abCD'); default: all files in input_dir.")
+    parser.add_argument("--aspect", "-a", type=parse_aspect, default=list(ONTOLOGIES),
+                        metavar="MF,CC,BP",
+                        help="Comma-separated GO aspects (models) to run: any of MF, CC, BP "
+                             "(case-insensitive). Default: mf,cc,bp.")
     parser.add_argument("--batch_size", "-b", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Proteins per inference batch (default: {DEFAULT_BATCH_SIZE}).")
     parser.add_argument("--threshold", "-t", type=parse_threshold, default=DEFAULT_THRESHOLD,
@@ -444,10 +491,12 @@ def main(argv=None):
     ids_file = args.ids_file if args.ids_file is not None else "None (all structures in input dir)"
     top_k = args.top_k if args.top_k is not None else "all"
     threshold_fs, threshold_struct = args.threshold
+    aspects = args.aspect
     logger.info(f"deepFRI2 version : {config_version()}")
     logger.info(f"Input dir       : {input_dir}")
     logger.info(f"Output dir      : {output_dir}")
     logger.info(f"IDs file        : {ids_file}")
+    logger.info(f"Aspects         : {', '.join(aspects)}")
     logger.info(f"Batch size      : {args.batch_size}")
     logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
     logger.info(f"Top k           : {top_k}")
@@ -464,14 +513,16 @@ def main(argv=None):
     num_labels_by_ontology = {ont: len(m) for ont, m in go_terms_mappings.items()}
 
     tokenizer, esm_model = load_esm(device, PARAMS_DIR)
-    models = load_models(device, num_labels_by_ontology, PARAMS_DIR)
+    # Build only the requested aspect models (--aspect).
+    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects)
 
     go_graph, go_name_map = load_go_name_map(PARAMS_DIR / f"go_{GO_VERSION}.obo")
-    # GO-hierarchy descendant indices are only needed for propagation (--prop).
+    # GO-hierarchy descendant indices are only needed for propagation (--prop), and only
+    # for the aspects that are actually run.
     descendant_indices_by_ontology = (
         {
-            ontology: build_go_descendant_indices(mapping, go_graph)
-            for ontology, mapping in go_terms_mappings.items()
+            ontology: build_go_descendant_indices(go_terms_mappings[ontology], go_graph)
+            for ontology in aspects
         }
         if args.prop
         else None
@@ -481,7 +532,7 @@ def main(argv=None):
         input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
         go_terms_mappings, descendant_indices_by_ontology, go_name_map,
         batch_size=args.batch_size, threshold=args.threshold, top_k=args.top_k,
-        prop=args.prop,
+        prop=args.prop, aspects=aspects,
     )
     logger.info("Done.")
 
