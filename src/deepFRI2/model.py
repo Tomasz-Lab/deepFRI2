@@ -1182,7 +1182,7 @@ def build_deepfri2_model(
 
     Args:
         ontology: ontology tag (e.g. ``"MF"``); locates weights under ``params/<ontology>/``.
-        run_names: dict with keys ``"kernel"``, ``"sequence"``, ``"fusion"`` -> run names.
+        run_names: dict with keys ``"structure"``, ``"sequence"``, ``"fusion"`` -> run names.
         num_labels: number of GO labels for this ontology.
         device: torch device to place the model on.
         params_dir: directory holding ``<ontology>/<run_name>.pth`` checkpoints.
@@ -1221,7 +1221,7 @@ def build_deepfri2_model(
         attn_hidden=attn_hidden,
         attn_temperature=attn_temperature,
     )
-    structure_model = load_run_weights(structure_model, ontology, run_names["kernel"], strict=False, params_dir=params_dir)
+    structure_model = load_run_weights(structure_model, ontology, run_names["structure"], strict=False, params_dir=params_dir)
     sequence_model = load_run_weights(sequence_model, ontology, run_names["sequence"], strict=False, params_dir=params_dir)
 
     fusion_model = FusionModel(

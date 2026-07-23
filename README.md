@@ -44,12 +44,12 @@ python src/deepFRI2/download_esm.py
 
 ### Notes
 
-- Both environments are named `deepfri2`. Rename one in its `.yml` file if you need both.
+- GPU environment is named `deepfri2`, whereas CPU environment is named `deepfri2_cpu` (name can be changed in the corressponding `.yml` file).
 - The deepFRI2 model checkpoints are already included under `params/<ontology>/`. Only the ESM-2 weights (downloaded in the last step) need to be fetched.
 - Once the ESM-2 weights are downloaded, all inference runs entirely offline.
 
 ## Usage
-
+ 
 Predict GO terms for a folder of protein structures (`.cif` / `.pdb`):
 
 ```bash
@@ -62,33 +62,40 @@ Options (run `python src/deepFRI2/deepfri2.py --help` for the full list):
 | --- | --- |
 | `-i`, `--input_dir` | Folder with `.cif` / `.pdb` structures. **(required)** |
 | `-o`, `--output_dir` | Folder for results (default: `<repo>/results`). |
-| `-f`, `--ids_file` | Text file listing structures to run, one per line (`abCD.cif` or just `abCD`); default: all files in the input folder. |
+| `-f`, `--ids_file` | Text file listing structures to run, one per line (e.g., `abCD.cif` or just `abCD`). Default: all files in the input folder. |
+| `-a`, `--aspect` | Comma-separated GO aspects (ontologies) to run: any of `MF`, `CC`, `BP` (case-insensitive). Default: `mf,cc,bp`. |
 | `-b`, `--batch_size` | Proteins per inference batch (default: `32`). |
-| `-t`, `--threshold` | Keep GO terms scoring ≥ this in the summary (default: `0.1`). |
+| `-t`, `--threshold` | Keep a GO term in the summary if **any** model scores ≥ threshold. Either one float applied to all models (`0.1`) or two comma-separated floats applied to fusion/sequence and structure respectively (`0.1,0.2`). The structural prober is trained with a different loss and outputs higher probabilities on average, hence the higher default for it. `0` (or `0,0`) keeps everything; `1` (or `1,1`) keeps nothing (default: `0.1,0.2`). |
 | `-k`, `--top_k` | Maximum GO terms per protein in the summary (default: all selected). |
-| `-p`, `--prop` | Propagate scores up the GO hierarchy (default: off). Adds the `preds_propagated/` folder and the propagated columns to the summary. |
-| `-v`, `--verbose` | Enable debug logging. |
+| `-p`, `--prop` | Propagate scores up the GO hierarchy. Adds the `preds_propagated/` folder and the propagated columns to the summary (default: off). |
+| `-v`, `--verbose` | Enable debug logging (default: off). |
 
-Example — run a subset of structures with a stricter threshold:
+### Example 
+
+Run a subset of structures with a stricter (global) thresholds:
 
 ```bash
-python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.2
+python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.3
 ```
 
-**Note:** in the current setup, the model processes up to 1020 aa (longer proteins are truncated). There is no lower limit; however, the structural prober is not sensitive to proteins shorter than 60 aa (in which case predictions equal the mean across the training data).
+### Notes
 
-### Output
+- GPU environment is the default and recommended one.
+- CPU probabilities may differ from the GPU probabilities on structure/fusion models due to bf16 autocast on GPU only. GO ranking and thresholded term sets remain similar but sometimes are not identical.
+- In the current setup, the model processes up to 1020 aa (longer proteins are truncated). There is no lower limit; however, the structural prober is not sensitive to proteins shorter than 60 aa (in which case predictions equal the mean across the training data).
+  
+## Output
 
-Predictions are written under the output folder (all three ontologies — MF, CC, BP):
+Predictions are written under the output folder for ontologies selected by the `--aspect` argument (MF, CC, BP by default):
 
-- `prediction_summary.csv` — top predicted GO terms per protein, with raw scores for the fusion, structure, and sequence branches (and GO-hierarchy-propagated scores when `--prop` is set).
+- `prediction_summary.csv` — top predicted GO terms per protein, with raw scores for the fusion, structure, and sequence models (and GO-hierarchy-propagated scores when `--prop` is set).
 - `preds/<protein>__<ontology>.csv` — full per-term probabilities (fusion / structure / sequence + gate).
 - `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation (only when `--prop` is set).
 - `log.txt` — the run log.
 
 For a quick overview of predicted functions, please take a look at the `pred_prob` (raw probabilities) column in `prediction_summary.csv` — or, when you run with `--prop`, the `pred_prop_prob` column (consistent probabilities i.e., the more general the term, the higher its probability). In some cases, it is also useful to check purely structure- and sequence-based outputs (see `struct_prob`, `seq_prob` etc.). For a downstream analysis, you may wish to check the full output in `preds` (and, with `--prop`, `preds_propagated`) folders.
 
-### Runtime
+## Runtime
 
 End-to-end runtime (excluding model loading at startup, which usually takes 6–8 s per run) depends primarily on the available compute resources and the protein length. Initial benchmarks with the default settings (batch size: 32) yielded the following throughput:
 
@@ -97,11 +104,11 @@ End-to-end runtime (excluding model loading at startup, which usually takes 6–
 
 These measurements were obtained on protein datasets with median sequence lengths of 150–440 amino acids. Additional benchmarking is underway, and the results will be shared in future updates.
 
-For large-scale inference, we recommend a GPU or a multi-core CPU cluster. On CPU, ESM embeddings are computed one sequence at a time, each forward using all available cores; results match the GPU output to ~6 decimal places (identical GO terms and ranking).
+For large-scale inference, we recommend a GPU or a multi-core CPU cluster. On CPU, ESM embeddings are computed one sequence at a time, each forward using all available core.
 
-Running the model on a personal computer (e.g., a laptop) is also possible. Initial tests on an Apple M3 Pro (11 CPU cores, 18 GB RAM) with a small set of proteins (median length ~150 aa; batch size: 32) took ~1.9 s/protein for embedding generation and ~36 s/protein for model inference — the structure branch is markedly slower here because Apple-Silicon PyTorch ships a generic (non-MKL) CPU build. Local CPU inference is therefore best suited to small runs: select a subset with `--ids_file`, and if memory is tight lower `--batch_size` (each structure is padded to a fixed size, so smaller batches reduce peak memory rather than change per-core parallelism).
+Running the model on a personal computer (e.g., a laptop) is also possible. Initial tests on an Apple M3 Pro (11 CPU cores, 18 GB RAM) with a small set of proteins (median length ~150 aa; batch size: 32) took ~1.9 s/protein for embedding generation and ~36 s/protein for model inference — the structure model is markedly slower here because Apple-Silicon PyTorch ships a generic (non-MKL) CPU build. Local CPU inference is therefore best suited to small runs: select a subset with `--ids_file`, and if memory is tight lower `--batch_size` (each structure is padded to a fixed size, so smaller batches reduce peak memory rather than change per-core parallelism).
 
-### Future releases
+## Future releases
 
 The model is still under development. We will soon add (among other things): 
 - sequence-only mode 
@@ -111,6 +118,6 @@ The model is still under development. We will soon add (among other things):
 
 In the nearest future we also plan to share the whole training pipeline in a fully reproducible manner. 
 
-### Troubleshooting
+## Troubleshooting
 
 If you run into installation problems, find a bug, or would like to propose an improvement, please raise an issue or write directly to p.szczerbiak[at]sanoscience.org.
