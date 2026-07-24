@@ -630,6 +630,27 @@ def generate_embeddings_for_batch(sequences, tokenizer, model, device, max_seq_l
 # Batch preparation & inference
 # =============================
 
+def fill_gap_offdiagonals(sim, valid_len, eps=1e-6):
+    """Restore the backbone-adjacency line that missing residues zero out in the similarity matrix.
+
+    A residue with missing coordinates has its whole distogram row/column set to 0, which breaks
+    the +/-1 off-diagonal (the "consecutive residues are neighbours" line, normally ~0.93). That
+    zero-cross is out of distribution for the structural prober, which was trained on gapless
+    structures. As a rough repair we set only the immediate +/-1 off-diagonals to 1 wherever a gap
+    zeroed them out (resolved neighbours are well above ``eps``, so they are left untouched). We do
+    not fill farther off-diagonals: their true similarity decays with distance, so forcing 1 there
+    would inject a stronger artificial bias. Operates in place over the valid residue range.
+    """
+    if valid_len <= 1:
+        return sim
+    i = torch.arange(valid_len - 1)
+    gap = sim[i, i + 1] < eps  # gap-induced zeros only; resolved neighbours are ~0.93
+    gi = i[gap]
+    sim[gi, gi + 1] = 1.0
+    sim[gi + 1, gi] = 1.0
+    return sim
+
+
 def preprocess_data(embedding, distogram, max_seq_len, emb_size, sigma_dist) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     embedding = torch.as_tensor(embedding, dtype=torch.float32) if embedding is not None else None
     distogram = torch.as_tensor(distogram, dtype=torch.float32) if distogram is not None else None
@@ -659,6 +680,8 @@ def preprocess_data(embedding, distogram, max_seq_len, emb_size, sigma_dist) -> 
     if distogram is not None:
         padded_distogram = pad_distogram(distogram, max_seq_len)
         distogram_processed = process_distogram(padded_distogram, sigma_dist)
+        # Repair the +/-1 backbone band where missing residues zeroed it out (structural gaps).
+        fill_gap_offdiagonals(distogram_processed, valid_len)
     else:
         distogram_processed = torch.zeros(max_seq_len, max_seq_len, dtype=torch.float32)
 

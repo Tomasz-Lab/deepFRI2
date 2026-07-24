@@ -77,6 +77,7 @@ python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.3
 - GPU environment is the default and recommended one.
 - CPU probabilities may differ from the GPU probabilities on structure/fusion models due to bf16 autocast on GPU only. GO ranking and thresholded term sets remain similar but sometimes are not identical.
 - In the current setup, the model processes up to 1020 aa (longer proteins are truncated). There is no lower limit; however, the structural prober is not sensitive to proteins shorter than 60 aa (in which case predictions equal the mean across the training data).
+- The current version was trained on gapless structures, so **fully resolved inputs (no missing residues) are recommended**. For structures with gaps, a missing residue zeroes out its whole row/column in the residue–residue similarity map, breaking the backbone-adjacency band and pushing the structure model out of distribution. As a rough safeguard we fill only the immediate `-1/+1` off-diagonals at gap positions with `1` (a non-zero, "these consecutive residues are neighbours" signal). This is deliberately minimal: farther-from-diagonal entries decay in value, so forcing `1` there would inject an artificial bias. A more principled fill (e.g. using the Gaussian-consistent ~0.93 for adjacency, or mean/median of real distances) may come in a future release.
   
 ## Output
 

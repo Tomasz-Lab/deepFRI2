@@ -85,7 +85,7 @@ BANNER = r"""
   / _` |/ _ \/ _ \ '_ \| |_  | |_) || |  __) |
  | (_| |  __/  __/ |_) |  _| |  _ < | | / __/
   \__,_|\___|\___| .__/|_|   |_| \_\___|_____|
-                  |_|
+                 |_|
    Predicting protein function
    Across sequence and structure,
    Scalable. Interpretable. By design.
@@ -471,9 +471,6 @@ def main(argv=None):
     # appears before the logging output even when stdout is piped/redirected.
     print(BANNER, flush=True)
 
-    # Heavy dependencies are imported only now, after argument parsing, so `--help`
-    # and argument errors return without paying the torch/transformers import cost.
-    import torch
     from utils import build_go_descendant_indices, configure_log_file
 
     # Console logging; --verbose lowers the level to DEBUG. Per-run file logging is
@@ -489,7 +486,12 @@ def main(argv=None):
     output_dir = args.output_dir if args.output_dir is not None else REPO_ROOT / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_log_file(output_dir / "log.txt")
-
+    
+    # Heavy dependencies are imported only now, after argument parsing, so `--help`
+    # and argument errors return without paying the torch/transformers import cost.
+    logger.info("Loading torch...")
+    import torch
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Report the full run configuration up front for transparency.
@@ -497,7 +499,7 @@ def main(argv=None):
     top_k = args.top_k if args.top_k is not None else "all"
     threshold_fs, threshold_struct = args.threshold
     aspects = args.aspect
-    logger.info(f"deepFRI2 version : {config_version()}")
+    logger.info(f"Model version   : {config_version()}")
     logger.info(f"Input dir       : {input_dir}")
     logger.info(f"Output dir      : {output_dir}")
     logger.info(f"IDs file        : {ids_file}")
