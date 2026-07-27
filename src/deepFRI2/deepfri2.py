@@ -172,7 +172,8 @@ def resolve_file_names(input_dir, ids_file):
     relative subfolder path, e.g. ``abCD``, ``abCD.cif``, ``sub/abCD`` or ``sub1/sub2/abCD.cif``.
     An id given without a structure extension resolves to ``<id>.cif`` if present, else
     ``<id>.pdb``. Each entry is probed directly on disk (no directory-wide scan). Returns the
-    resolved paths, or None when ``ids_file`` is None (process every structure in the folder).
+    resolved paths *relative to* ``input_dir``, or None when ``ids_file`` is None (process every
+    structure in the folder).
     """
     if ids_file is None:
         return None
@@ -193,9 +194,9 @@ def resolve_file_names(input_dir, ids_file):
             candidates = [rel, rel.with_suffix(".pdb" if suffix == ".cif" else ".cif")]
         else:
             candidates = [Path(f"{entry}.cif"), Path(f"{entry}.pdb")]
-        match = next((input_dir / c for c in candidates if (input_dir / c).is_file()), None)
+        match = next((c for c in candidates if (input_dir / c).is_file()), None)
         if match is not None:
-            resolved.append(match)
+            resolved.append(match)  # relative to input_dir; joined again in prepare_batches
         else:
             missing.append(entry)
     if missing:

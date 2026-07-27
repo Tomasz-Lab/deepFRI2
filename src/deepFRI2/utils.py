@@ -713,8 +713,9 @@ def prepare_batches_for_inference(
         atom_name: atom used for distances (e.g. ``"CA"``).
         max_seq_len / emb_size / sigma_dist: preprocessing constants (see ``preprocess_data``).
         batch_size: number of proteins per yielded batch.
-        file_names: optional explicit list of structure file paths to run (already resolved,
-            may live in subfolders); when None, every top-level structure in ``struct_path`` is used.
+        file_names: optional explicit list of structures to run, each a path relative to
+            ``struct_path`` (bare name or subfolder path) or an absolute path; non-existent entries
+            are skipped. When None, every top-level structure in ``struct_path`` is used.
         preprocessing: if True, pad/process into stacked tensors; otherwise yield raw arrays.
         return_struct_info: if True, also yield per-protein structure metadata.
 
@@ -725,10 +726,16 @@ def prepare_batches_for_inference(
 
     struct_path = Path(struct_path)
 
-    # With an explicit selection use those paths directly (supports subfolders); otherwise scan
-    # the top level of struct_path.
+    # With an explicit selection, resolve each entry against struct_path (absolute entries are
+    # used as-is), keeping only those that exist; supports bare names and relative subfolder paths.
+    # Otherwise scan the top level of struct_path.
     if file_names is not None:
-        paths = [Path(p) for p in file_names]
+        paths = []
+        for name in file_names:
+            p = Path(name)
+            full = p if p.is_absolute() else struct_path / p
+            if full.is_file():
+                paths.append(full)
     else:
         paths = _list_structure_files(struct_path)
 
