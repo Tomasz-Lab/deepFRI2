@@ -56,12 +56,13 @@ Options (run `python src/deepFRI2/deepfri2.py --help` for the full list):
 | --- | --- |
 | `-i`, `--input_dir` | Folder with `.cif` / `.pdb` structures. **(required)** |
 | `-o`, `--output_dir` | Folder for results (default: `<repo>/results`). |
-| `-f`, `--ids_file` | Text file listing structures to run, one per line (e.g., `abCD.cif` or just `abCD`). Default: all files in the input folder. |
+| `-f`, `--ids_file` | Text file listing structures to run, one per line. Each entry is an id, optionally with a `.cif` / `.pdb` extension and/or a relative subfolder path (`abCD`, `abCD.cif`, `sub/abCD`, `sub1/sub2/abCD.cif`), resolved under the input folder. An id without an extension resolves to `.cif` if present, else `.pdb`. Default: all top-level files in the input folder. |
 | `-a`, `--aspect` | Comma-separated GO aspects (ontologies) to run: any of `MF`, `CC`, `BP` (case-insensitive). Default: `mf,cc,bp`. |
 | `-b`, `--batch_size` | Proteins per inference batch (default: `32`). |
 | `-t`, `--threshold` | Keep a GO term in the summary if **any** model scores ≥ threshold. Either one float applied to all models (`0.1`) or two comma-separated floats applied to fusion/sequence and structure respectively (`0.1,0.2`). The structural prober is trained with a different loss and outputs higher probabilities on average, hence the higher default for it. `0` (or `0,0`) keeps everything; `1` (or `1,1`) keeps nothing (default: `0.1,0.2`). |
 | `-k`, `--top_k` | Maximum GO terms per protein in the summary (default: all selected). |
 | `-p`, `--prop` | Propagate scores up the GO hierarchy. Adds the `preds_propagated/` folder and the propagated columns to the summary (default: off). |
+| `-s`, `--summary` | Write only `prediction_summary.csv`, skipping the `preds/` (and `preds_propagated/`) folders (default: off). With `--prop`, the summary still includes the propagated columns. |
 | `-v`, `--verbose` | Enable debug logging (default: off). |
 
 ### Example 
@@ -84,8 +85,8 @@ python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.3
 Predictions are written under the output folder for ontologies selected by the `--aspect` argument (MF, CC, BP by default):
 
 - `prediction_summary.csv` — top predicted GO terms per protein, with raw scores for the fusion, structure, and sequence models (and GO-hierarchy-propagated scores when `--prop` is set).
-- `preds/<protein>__<ontology>.csv` — full per-term probabilities (fusion / structure / sequence + gate).
-- `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation (only when `--prop` is set).
+- `preds/<protein>__<ontology>.csv` — full per-term probabilities (fusion / structure / sequence + gate). Omitted when `--summary` is set.
+- `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation (only when `--prop` is set; omitted when `--summary` is set).
 - `log.txt` — the run log.
 
 For a quick overview of predicted functions, please take a look at the `pred_prob` (raw probabilities) column in `prediction_summary.csv` — or, when you run with `--prop`, the `pred_prop_prob` column (consistent probabilities i.e., the more general the term, the higher its probability). In some cases, it is also useful to check purely structure- and sequence-based outputs (see `struct_prob`, `seq_prob` etc.). For a downstream analysis, you may wish to check the full output in `preds` (and, with `--prop`, `preds_propagated`) folders.

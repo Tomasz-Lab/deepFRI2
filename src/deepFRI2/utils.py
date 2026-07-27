@@ -713,7 +713,8 @@ def prepare_batches_for_inference(
         atom_name: atom used for distances (e.g. ``"CA"``).
         max_seq_len / emb_size / sigma_dist: preprocessing constants (see ``preprocess_data``).
         batch_size: number of proteins per yielded batch.
-        file_names: optional set/list of file names to restrict to.
+        file_names: optional explicit list of structure file paths to run (already resolved,
+            may live in subfolders); when None, every top-level structure in ``struct_path`` is used.
         preprocessing: if True, pad/process into stacked tensors; otherwise yield raw arrays.
         return_struct_info: if True, also yield per-protein structure metadata.
 
@@ -724,11 +725,12 @@ def prepare_batches_for_inference(
 
     struct_path = Path(struct_path)
 
-    all_paths = _list_structure_files(struct_path)
-    paths = all_paths
+    # With an explicit selection use those paths directly (supports subfolders); otherwise scan
+    # the top level of struct_path.
     if file_names is not None:
-        file_names = set(file_names)
-        paths = [el for el in paths if el.name in file_names]
+        paths = [Path(p) for p in file_names]
+    else:
+        paths = _list_structure_files(struct_path)
 
     # Keep one file per protein id, preferring .cif over .pdb (see _dedupe_structure_paths).
     paths = _dedupe_structure_paths(paths)

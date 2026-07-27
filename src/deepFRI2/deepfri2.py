@@ -12,9 +12,11 @@ Inputs
 ------
     --input_dir  / -i : folder with protein structures (``.cif`` / ``.pdb``).       [required]
     --output_dir / -o : folder for results; defaults to ``<repo>/results`` if omitted.
-    --ids_file   / -f : text file with one entry per line naming the structures to
-                        run (e.g. ``abCD.cif`` or just ``abCD``); if omitted, every
-                        structure in ``--input_dir`` is processed.
+    --ids_file   / -f : text file with one entry per line naming the structures to run;
+                        each entry is an id, optionally with a ``.cif`` / ``.pdb`` extension
+                        and/or a relative subfolder path (``abCD``, ``abCD.cif``, ``sub/abCD``,
+                        ``sub1/sub2/abCD.cif``); resolved under ``--input_dir``. If omitted,
+                        every top-level structure in ``--input_dir`` is processed.
     --aspect     / -a : comma-separated GO aspects (models) to run: any of MF, CC, BP
                         (case-insensitive). Default: mf,cc,bp.
     --batch_size / -b : proteins per inference batch (default: 32).
@@ -26,14 +28,18 @@ Inputs
                         writes the preds_propagated/ folder and adds the propagated columns
                         (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob,
                         struct_prop_prob, seq_prop_prob) to the summary.
+    --summary    / -s : write only prediction_summary.csv, skipping the preds/ (and
+                        preds_propagated/) folders (default: off). Combines with --prop:
+                        the summary still gets the propagated columns.
     --verbose    / -v : enable debug logging (e.g. per-checkpoint weight-load report).
 
 Output (under <output_dir>; same as inference.ipynb)
 ------
     preds/<protein>__<ontology>.csv            : all GO terms with raw fusion / structure /
-                                                 sequence probabilities and the gate.
+                                                 sequence probabilities and the gate (omitted with --summary).
     preds_propagated/<protein>__<ontology>.csv : all GO terms with hierarchically-propagated
-                                                 source terms and probabilities (only with --prop).
+                                                 source terms and probabilities (only with --prop, and
+                                                 omitted with --summary).
     prediction_summary.csv                     : thresholded / top-k predictions per protein
                                                  across all ontologies (raw, plus propagated
                                                  columns only with --prop).
@@ -160,10 +166,13 @@ def load_models(device, num_labels_by_ontology, params_dir, ontologies=None):
 
 
 def resolve_file_names(input_dir, ids_file):
-    """Turn an ids file into a list of structure file names present in ``input_dir``.
+    """Resolve an ids file into a list of structure file paths under ``input_dir``.
 
-    Each line may be a file name (``abCD.cif``) or a bare id (``abCD``). Returns None
-    when ``ids_file`` is None (meaning: process every structure in the folder).
+    Each line is a structure id, optionally with a ``.cif`` / ``.pdb`` extension and/or a
+    relative subfolder path, e.g. ``abCD``, ``abCD.cif``, ``sub/abCD`` or ``sub1/sub2/abCD.cif``.
+    An id given without a structure extension resolves to ``<id>.cif`` if present, else
+    ``<id>.pdb``. Each entry is probed directly on disk (no directory-wide scan). Returns the
+    resolved paths, or None when ``ids_file`` is None (process every structure in the folder).
     """
     if ids_file is None:
         return None
@@ -173,18 +182,20 @@ def resolve_file_names(input_dir, ids_file):
     entries = [line.strip() for line in ids_file.read_text().splitlines() if line.strip()]
     if not entries:
         _fatal(f"IDs file is empty: {ids_file}")
-    files = sorted(Path(input_dir).glob("*.cif")) + sorted(Path(input_dir).glob("*.pdb"))
-    by_name = {f.name: f.name for f in files}
-    by_stem = {}
-    for f in files:
-        by_stem.setdefault(f.stem, f.name)
 
+    input_dir = Path(input_dir)
     resolved, missing = [], []
     for entry in entries:
-        if entry in by_name:
-            resolved.append(by_name[entry])
-        elif Path(entry).stem in by_stem:
-            resolved.append(by_stem[Path(entry).stem])
+        rel = Path(entry)
+        suffix = rel.suffix.lower()
+        # Candidate relative paths to probe, preferring .cif; a bare id tries both extensions.
+        if suffix in (".cif", ".pdb"):
+            candidates = [rel, rel.with_suffix(".pdb" if suffix == ".cif" else ".cif")]
+        else:
+            candidates = [Path(f"{entry}.cif"), Path(f"{entry}.pdb")]
+        match = next((input_dir / c for c in candidates if (input_dir / c).is_file()), None)
+        if match is not None:
+            resolved.append(match)
         else:
             missing.append(entry)
     if missing:
@@ -201,18 +212,21 @@ def _fatal(message):
     raise SystemExit(1)
 
 
-def validate_input_dir(input_dir):
+def validate_input_dir(input_dir, require_structures=True):
     """Validate the input directory before any heavy work.
 
-    Logs an ERROR and terminates when there is nothing to run on (the directory is
-    missing, is not a directory, or holds no .cif/.pdb structures). Empty (zero-byte)
-    structure files are reported as a non-fatal warning, since other files may be fine.
+    Logs an ERROR and terminates when the directory is missing or is not a directory. When
+    ``require_structures`` is True, also fatals if the top level holds no .cif/.pdb structures
+    and warns about empty (zero-byte) ones. With an ids file (which may point into subfolders)
+    pass ``require_structures=False``; ``resolve_file_names`` then reports unresolved ids itself.
     """
     input_dir = Path(input_dir)
     if not input_dir.exists():
         _fatal(f"Input dir does not exist: {input_dir}")
     if not input_dir.is_dir():
         _fatal(f"Input path is not a directory: {input_dir}")
+    if not require_structures:
+        return
     structures = sorted(input_dir.glob("*.cif")) + sorted(input_dir.glob("*.pdb"))
     if not structures:
         _fatal(f"Input dir contains no .cif/.pdb structures: {input_dir}")
@@ -228,7 +242,7 @@ def validate_input_dir(input_dir):
 
 def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_model,
                   device, go_terms_mappings, descendant_indices_by_ontology, go_name_map,
-                  batch_size, threshold, top_k, prop=False, aspects=None):
+                  batch_size, threshold, top_k, prop=False, aspects=None, summary_only=False):
     """Run all-ontology inference and write the same outputs as inference.ipynb.
 
     Produces, under ``output_dir``:
@@ -239,6 +253,9 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
     - ``preds_propagated/<protein>__<ontology>.csv`` (hierarchically-propagated terms + probs)
     - the propagated columns (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob,
       struct_prop_prob, seq_prop_prob) in ``prediction_summary.csv``.
+
+    When ``summary_only`` is True, only ``prediction_summary.csv`` is written (no ``preds/`` or
+    ``preds_propagated/`` folders); ``prop`` still adds the propagated columns to the summary.
     """
     from utils import (
         build_all_prediction_table,
@@ -255,10 +272,12 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
     output_dir = Path(output_dir)
     preds_dir = output_dir / "preds"
-    preds_dir.mkdir(parents=True, exist_ok=True)
     preds_propagated_dir = output_dir / "preds_propagated"
-    if prop:
-        preds_propagated_dir.mkdir(parents=True, exist_ok=True)
+    # With --summary we write only the summary table (no per-protein folders).
+    if not summary_only:
+        preds_dir.mkdir(parents=True, exist_ok=True)
+        if prop:
+            preds_propagated_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "prediction_summary.csv"
     # The summary is appended one batch at a time (never held whole in memory). Within each batch
     # rows are ordered protein-major (proteins in batch order, aspects MF -> CC -> BP); batches are
@@ -328,15 +347,17 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
             )
 
             # Per-protein raw table (fusion / structure / sequence branches), plus the
-            # propagated table when propagation is enabled.
-            for i, record in enumerate(batch_records):
-                build_all_prediction_table([record], mapping).to_csv(
-                    preds_dir / f"{record['protein_id']}__{ontology}.csv", index=False
-                )
-                if prop:
-                    build_propagated_prediction_table([propagated_batch_records[i]], mapping).to_csv(
-                        preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
+            # propagated table when propagation is enabled. Skipped entirely with --summary
+            # (propagation is still computed above so the summary keeps its propagated columns).
+            if not summary_only:
+                for i, record in enumerate(batch_records):
+                    build_all_prediction_table([record], mapping).to_csv(
+                        preds_dir / f"{record['protein_id']}__{ontology}.csv", index=False
                     )
+                    if prop:
+                        build_propagated_prediction_table([propagated_batch_records[i]], mapping).to_csv(
+                            preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
+                        )
 
             # Summary rows: keep a term if any branch (fusion / structure / sequence)
             # passes the threshold. Collected per aspect, written out below per batch.
@@ -377,7 +398,9 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
     log_timing("Inference time", inference_elapsed, total_proteins, "protein")
     log_timing("Total time", time.perf_counter() - start, total_proteins, "protein")
-    if prop:
+    if summary_only:
+        logger.info("Summary-only mode: per-protein tables not written")
+    elif prop:
         logger.info(f"Wrote per-protein tables to {preds_dir} and {preds_propagated_dir}")
     else:
         logger.info(f"Wrote per-protein tables to {preds_dir}")
@@ -459,6 +482,10 @@ def parse_args(argv=None):
     parser.add_argument("--prop", "-p", action="store_true",
                         help="Propagate scores up the GO hierarchy (default: off); also writes "
                              "the preds_propagated/ folder and the propagated summary columns.")
+    parser.add_argument("--summary", "-s", action="store_true",
+                        help="Write only prediction_summary.csv, skipping the preds/ (and "
+                             "preds_propagated/) folders (default: off). With --prop, the summary "
+                             "still includes the propagated columns.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging (e.g. per-checkpoint weight-load report).")
     return parser.parse_args(argv)
@@ -508,12 +535,13 @@ def main(argv=None):
     logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
     logger.info(f"Top k           : {top_k}")
     logger.info(f"Propagate       : {args.prop}")
+    logger.info(f"Summary only    : {args.summary}")
     logger.info(f"Verbose         : {args.verbose}")
     logger.info(f"Device          : {device}")
 
     # Validate inputs before any heavy work: on fatal problems (missing/empty input dir
     # or ids file, or no matching ids) this logs an ERROR and terminates without running.
-    validate_input_dir(input_dir)
+    validate_input_dir(input_dir, require_structures=args.ids_file is None)
     file_names = resolve_file_names(input_dir, args.ids_file)
 
     go_terms_mappings = load_go_terms_mappings(PARAMS_DIR)
@@ -539,7 +567,7 @@ def main(argv=None):
         input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
         go_terms_mappings, descendant_indices_by_ontology, go_name_map,
         batch_size=args.batch_size, threshold=args.threshold, top_k=args.top_k,
-        prop=args.prop, aspects=aspects,
+        prop=args.prop, aspects=aspects, summary_only=args.summary,
     )
     logger.info("Done.")
 
