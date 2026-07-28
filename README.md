@@ -53,21 +53,29 @@ python src/deepFRI2/download_esm.py
 Predict GO terms for a folder of protein structures (`.cif` / `.pdb`):
 
 ```bash
-python src/deepFRI2/deepfri2.py --input_dir path/to/structures
+python src/deepFRI2/deepfri2.py --input path/to/structures
+```
+
+Or run the sequence model on a FASTA file of sequences (no structures needed):
+
+```bash
+python src/deepFRI2/deepfri2.py --input sequences.fasta
 ```
 
 Options (run `python src/deepFRI2/deepfri2.py --help` for the full list):
 
 | Flag | Description |
 | --- | --- |
-| `-i`, `--input_dir` | Folder with `.cif` / `.pdb` structures. **(required)** |
+| `-i`, `--input` | Either a folder with `.cif` / `.pdb` structures **or** a single FASTA file of sequences. A FASTA input runs the sequence model only: `--model` and `--ids_file` are ignored, and `--threshold` uses only its first value. **(required)** |
 | `-o`, `--output_dir` | Folder for results (default: `<repo>/results`). |
-| `-f`, `--ids_file` | Text file listing structures to run, one per line (e.g., `abCD.cif` or just `abCD`). Default: all files in the input folder. |
+| `-f`, `--ids_file` | Text file listing structures to run, one per line. Each entry is an id, optionally with a `.cif` / `.pdb` extension and/or a relative subfolder path (`abCD`, `abCD.cif`, `sub/abCD`, `sub1/sub2/abCD.cif`), resolved under the input folder. An id without an extension resolves to `.cif` if present, else `.pdb`. Default: all *top-level* files in the input folder. |
 | `-a`, `--aspect` | Comma-separated GO aspects (ontologies) to run: any of `MF`, `CC`, `BP` (case-insensitive). Default: `mf,cc,bp`. |
+| `-m`, `--model` | Which model to run: `sequence` (embeddings only), `structure` (distograms only) or `fusion` (both). Only the needed inputs are computed and outputs carry only that model's columns. Default: `fusion`. |
 | `-b`, `--batch_size` | Proteins per inference batch (default: `32`). |
-| `-t`, `--threshold` | Keep a GO term in the summary if **any** model scores ≥ threshold. Either one float applied to all models (`0.1`) or two comma-separated floats applied to fusion/sequence and structure respectively (`0.1,0.2`). The structural prober is trained with a different loss and outputs higher probabilities on average, hence the higher default for it. `0` (or `0,0`) keeps everything; `1` (or `1,1`) keeps nothing (default: `0.1,0.2`). |
+| `-t`, `--threshold` | Keep a GO term in the summary if **any** model (sequence, structure, fusion) scores ≥ threshold. Either one float applied to all models (`0.1`) or two comma-separated floats applied to fusion/sequence and structure respectively (`0.1,0.2`). The structural prober is trained with a different loss and outputs higher probabilities on average, hence the higher default for it. `0` (or `0,0`) keeps everything; `1` (or `1,1`) keeps nothing (default: `0.1,0.2`). |
 | `-k`, `--top_k` | Maximum GO terms per protein in the summary (default: all selected). |
 | `-p`, `--prop` | Propagate scores up the GO hierarchy. Adds the `preds_propagated/` folder and the propagated columns to the summary (default: off). |
+| `-s`, `--summary` | Write only `prediction_summary.csv`, skipping the `preds/` (and `preds_propagated/`) folders (default: off). With `--prop`, the summary still includes the propagated columns. |
 | `-v`, `--verbose` | Enable debug logging (default: off). |
 
 ### Example 
@@ -83,14 +91,15 @@ python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.3
 - GPU environment is the default and recommended one.
 - CPU probabilities may differ from the GPU probabilities on structure/fusion models due to bf16 autocast on GPU only. GO ranking and thresholded term sets remain similar but sometimes are not identical.
 - In the current setup, the model processes up to 1020 aa (longer proteins are truncated). There is no lower limit; however, the structural prober is not sensitive to proteins shorter than 60 aa (in which case predictions equal the mean across the training data).
+- The current version was trained on gapless structures, so **fully resolved inputs (no missing residues) are recommended**. For structures with gaps, a missing residue zeroes out its whole row/column in the residue–residue similarity map, breaking the backbone-adjacency band and pushing the structure model out of distribution. As a rough safeguard we fill only the immediate `-1/+1` off-diagonals at gap positions with `1` (a non-zero, "these consecutive residues are neighbours" signal). 
   
 ## Output
 
 Predictions are written under the output folder for ontologies selected by the `--aspect` argument (MF, CC, BP by default):
 
 - `prediction_summary.csv` — top predicted GO terms per protein, with raw scores for the fusion, structure, and sequence models (and GO-hierarchy-propagated scores when `--prop` is set).
-- `preds/<protein>__<ontology>.csv` — full per-term probabilities (fusion / structure / sequence + gate).
-- `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation (only when `--prop` is set).
+- `preds/<protein>__<ontology>.csv` — full per-term probabilities (fusion / structure / sequence + gate). Omitted when `--summary` is set.
+- `preds_propagated/<protein>__<ontology>.csv` — full per-term probabilities after GO-hierarchy propagation (only when `--prop` is set; omitted when `--summary` is set).
 - `log.txt` — the run log.
 
 For a quick overview of predicted functions, please take a look at the `pred_prob` (raw probabilities) column in `prediction_summary.csv` — or, when you run with `--prop`, the `pred_prop_prob` column (consistent probabilities i.e., the more general the term, the higher its probability). In some cases, it is also useful to check purely structure- and sequence-based outputs (see `struct_prob`, `seq_prob` etc.). For a downstream analysis, you may wish to check the full output in `preds` (and, with `--prop`, `preds_propagated`) folders.

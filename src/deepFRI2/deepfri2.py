@@ -5,18 +5,27 @@ Predict Gene Ontology (GO) terms for proteins with deepFRI2.
 
 Usage
 -----
-    python src/deepFRI2/deepfri2.py --input_dir /path/to/structures
+    python src/deepFRI2/deepfri2.py --input /path/to/structures
     python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt
+    python src/deepFRI2/deepfri2.py -i sequences.fasta -o results/run2   # sequence model
 
 Inputs
 ------
-    --input_dir  / -i : folder with protein structures (``.cif`` / ``.pdb``).       [required]
+    --input      / -i : either a folder with protein structures (``.cif`` / ``.pdb``) or a single
+                        FASTA file of sequences. A FASTA input runs the sequence model only:
+                        ``--model`` and ``--ids_file`` are ignored, and ``--threshold`` uses only
+                        its first value.                                              [required]
     --output_dir / -o : folder for results; defaults to ``<repo>/results`` if omitted.
-    --ids_file   / -f : text file with one entry per line naming the structures to
-                        run (e.g. ``abCD.cif`` or just ``abCD``); if omitted, every
-                        structure in ``--input_dir`` is processed.
-    --aspect     / -a : comma-separated GO aspects (models) to run: any of MF, CC, BP
+    --ids_file   / -f : text file with one entry per line naming the structures to run;
+                        each entry is an id, optionally with a ``.cif`` / ``.pdb`` extension
+                        and/or a relative subfolder path (``abCD``, ``abCD.cif``, ``sub/abCD``,
+                        ``sub1/sub2/abCD.cif``); resolved under ``--input``. If omitted,
+                        every top-level structure in ``--input`` is processed. Ignored for FASTA input.
+    --aspect     / -a : comma-separated GO aspects (ontologies) to run: any of MF, CC, BP
                         (case-insensitive). Default: mf,cc,bp.
+    --model      / -m : which model to run: ``sequence`` (embeddings only), ``structure``
+                        (distograms only) or ``fusion`` (both). Only the needed inputs are
+                        computed and outputs carry only that model's columns. Default: fusion.
     --batch_size / -b : proteins per inference batch (default: 32).
     --threshold  / -t : one float (applied to all branches) or two comma-separated floats
                         (fusion/sequence, structure) for keeping GO terms in the summary
@@ -26,16 +35,20 @@ Inputs
                         writes the preds_propagated/ folder and adds the propagated columns
                         (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob,
                         struct_prop_prob, seq_prop_prob) to the summary.
+    --summary    / -s : write only prediction_summary.csv, skipping the preds/ (and
+                        preds_propagated/) folders (default: off). Combines with --prop:
+                        the summary still gets the propagated columns.
     --verbose    / -v : enable debug logging (e.g. per-checkpoint weight-load report).
 
-Output (under <output_dir>; same as inference.ipynb)
+Output (under <output_dir>)
 ------
-    preds/<protein>__<ontology>.csv            : all GO terms with raw fusion / structure /
-                                                 sequence probabilities and the gate.
-    preds_propagated/<protein>__<ontology>.csv : all GO terms with hierarchically-propagated
-                                                 source terms and probabilities (only with --prop).
-    prediction_summary.csv                     : thresholded / top-k predictions per protein
-                                                 across all ontologies (raw, plus propagated
+    preds/<protein>__<ontology>.csv            : per-term probabilities for the selected --model
+                                                 (fusion also carries struct/seq probs + gate;
+                                                 omitted with --summary).
+    preds_propagated/<protein>__<ontology>.csv : per-term hierarchically-propagated source terms and
+                                                 probabilities (only with --prop; omitted with --summary).
+    prediction_summary.csv                     : thresholded / top-k predictions per protein across all
+                                                 ontologies (selected-model columns, plus propagated
                                                  columns only with --prop).
     log.txt                                    : run log.
 
@@ -45,6 +58,8 @@ head checkpoints are expected under ``params/<ontology>/``.
 
 import argparse
 import json
+import shlex
+import sys
 import time
 from logging import DEBUG, INFO, basicConfig, getLogger
 from pathlib import Path
@@ -85,7 +100,7 @@ BANNER = r"""
   / _` |/ _ \/ _ \ '_ \| |_  | |_) || |  __) |
  | (_| |  __/  __/ |_) |  _| |  _ < | | / __/
   \__,_|\___|\___| .__/|_|   |_| \_\___|_____|
-                  |_|
+                 |_|
    Predicting protein function
    Across sequence and structure,
    Scalable. Interpretable. By design.
@@ -135,8 +150,8 @@ def load_esm(device, params_dir):
     return tokenizer, model
 
 
-def load_models(device, num_labels_by_ontology, params_dir, ontologies=None):
-    """Build and load a deepFRI2 fusion model for each requested ontology (default: all)."""
+def load_models(device, num_labels_by_ontology, params_dir, ontologies=None, model_type="fusion"):
+    """Build and load a deepFRI2 model (``model_type``: fusion/structure/sequence) per ontology."""
     from model import build_deepfri2_model
 
     ontologies = list(ONTOLOGIES) if ontologies is None else list(ontologies)
@@ -152,18 +167,23 @@ def load_models(device, num_labels_by_ontology, params_dir, ontologies=None):
             m_anti=M_ANTI,
             num_diag=NUM_DIAG,
             num_anti=NUM_ANTI,
+            model_type=model_type,
         )
         for ontology in ontologies
     }
-    logger.info(f"deepFRI2 models loaded: {', '.join(ontologies)}")
+    logger.info(f"deepFRI2 {model_type} model(s) loaded: {', '.join(ontologies)}")
     return models
 
 
 def resolve_file_names(input_dir, ids_file):
-    """Turn an ids file into a list of structure file names present in ``input_dir``.
+    """Resolve an ids file into a list of structure file paths under ``input_dir``.
 
-    Each line may be a file name (``abCD.cif``) or a bare id (``abCD``). Returns None
-    when ``ids_file`` is None (meaning: process every structure in the folder).
+    Each line is a structure id, optionally with a ``.cif`` / ``.pdb`` extension and/or a
+    relative subfolder path, e.g. ``abCD``, ``abCD.cif``, ``sub/abCD`` or ``sub1/sub2/abCD.cif``.
+    An id given without a structure extension resolves to ``<id>.cif`` if present, else
+    ``<id>.pdb``. Each entry is probed directly on disk (no directory-wide scan). Returns the
+    resolved paths *relative to* ``input_dir``, or None when ``ids_file`` is None (process every
+    structure in the folder).
     """
     if ids_file is None:
         return None
@@ -173,18 +193,20 @@ def resolve_file_names(input_dir, ids_file):
     entries = [line.strip() for line in ids_file.read_text().splitlines() if line.strip()]
     if not entries:
         _fatal(f"IDs file is empty: {ids_file}")
-    files = sorted(Path(input_dir).glob("*.cif")) + sorted(Path(input_dir).glob("*.pdb"))
-    by_name = {f.name: f.name for f in files}
-    by_stem = {}
-    for f in files:
-        by_stem.setdefault(f.stem, f.name)
 
+    input_dir = Path(input_dir)
     resolved, missing = [], []
     for entry in entries:
-        if entry in by_name:
-            resolved.append(by_name[entry])
-        elif Path(entry).stem in by_stem:
-            resolved.append(by_stem[Path(entry).stem])
+        rel = Path(entry)
+        suffix = rel.suffix.lower()
+        # Candidate relative paths to probe, preferring .cif; a bare id tries both extensions.
+        if suffix in (".cif", ".pdb"):
+            candidates = [rel, rel.with_suffix(".pdb" if suffix == ".cif" else ".cif")]
+        else:
+            candidates = [Path(f"{entry}.cif"), Path(f"{entry}.pdb")]
+        match = next((c for c in candidates if (input_dir / c).is_file()), None)
+        if match is not None:
+            resolved.append(match)  # relative to input_dir; joined again in prepare_batches
         else:
             missing.append(entry)
     if missing:
@@ -201,18 +223,21 @@ def _fatal(message):
     raise SystemExit(1)
 
 
-def validate_input_dir(input_dir):
+def validate_input_dir(input_dir, require_structures=True):
     """Validate the input directory before any heavy work.
 
-    Logs an ERROR and terminates when there is nothing to run on (the directory is
-    missing, is not a directory, or holds no .cif/.pdb structures). Empty (zero-byte)
-    structure files are reported as a non-fatal warning, since other files may be fine.
+    Logs an ERROR and terminates when the directory is missing or is not a directory. When
+    ``require_structures`` is True, also fatals if the top level holds no .cif/.pdb structures
+    and warns about empty (zero-byte) ones. With an ids file (which may point into subfolders)
+    pass ``require_structures=False``; ``resolve_file_names`` then reports unresolved ids itself.
     """
     input_dir = Path(input_dir)
     if not input_dir.exists():
         _fatal(f"Input dir does not exist: {input_dir}")
     if not input_dir.is_dir():
         _fatal(f"Input path is not a directory: {input_dir}")
+    if not require_structures:
+        return
     structures = sorted(input_dir.glob("*.cif")) + sorted(input_dir.glob("*.pdb"))
     if not structures:
         _fatal(f"Input dir contains no .cif/.pdb structures: {input_dir}")
@@ -226,19 +251,28 @@ def validate_input_dir(input_dir):
 # Inference
 # =========
 
-def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_model,
+def run_inference(input_path, output_dir, file_names, models, tokenizer, esm_model,
                   device, go_terms_mappings, descendant_indices_by_ontology, go_name_map,
-                  batch_size, threshold, top_k, prop=False, aspects=None):
-    """Run all-ontology inference and write the same outputs as inference.ipynb.
+                  batch_size, threshold, top_k, prop=False, aspects=None, summary_only=False,
+                  model="fusion", from_fasta=False):
+    """Run inference for the selected model (fusion/structure/sequence) and write outputs.
+
+    ``input_path`` is either a directory of structures or, when ``from_fasta`` is True, a single
+    FASTA file of sequences (in which case ``model`` is 'sequence' and inputs are ESM embeddings
+    only, no distograms).
 
     Produces, under ``output_dir``:
-    - ``preds/<protein>__<ontology>.csv``            (raw fusion / structure / sequence probs + gate)
+    - ``preds/<protein>__<ontology>.csv``            (per-term probabilities for the selected model;
+                                                      fusion also includes struct/seq probs + gate)
     - ``prediction_summary.csv``                     (thresholded / top-k summary across ontologies)
 
     When ``prop`` is True, GO-hierarchy propagation is run as well, which additionally produces:
     - ``preds_propagated/<protein>__<ontology>.csv`` (hierarchically-propagated terms + probs)
     - the propagated columns (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob,
       struct_prop_prob, seq_prop_prob) in ``prediction_summary.csv``.
+
+    When ``summary_only`` is True, only ``prediction_summary.csv`` is written (no ``preds/`` or
+    ``preds_propagated/`` folders); ``prop`` still adds the propagated columns to the summary.
     """
     from utils import (
         build_all_prediction_table,
@@ -247,6 +281,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
         inference_for_batch,
         log_timing,
         prepare_batches_for_inference,
+        prepare_batches_from_fasta,
         propagate_prediction_record,
     )
 
@@ -255,10 +290,12 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
     output_dir = Path(output_dir)
     preds_dir = output_dir / "preds"
-    preds_dir.mkdir(parents=True, exist_ok=True)
     preds_propagated_dir = output_dir / "preds_propagated"
-    if prop:
-        preds_propagated_dir.mkdir(parents=True, exist_ok=True)
+    # With --summary we write only the summary table (no per-protein folders).
+    if not summary_only:
+        preds_dir.mkdir(parents=True, exist_ok=True)
+        if prop:
+            preds_propagated_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "prediction_summary.csv"
     # The summary is appended one batch at a time (never held whole in memory). Within each batch
     # rows are ordered protein-major (proteins in batch order, aspects MF -> CC -> BP); batches are
@@ -271,18 +308,31 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
     inference_elapsed = 0.0  # model forward-pass time only (excludes parsing/embedding/IO)
     start = time.perf_counter()
 
-    batch_iterator = prepare_batches_for_inference(
-        input_dir,
-        tokenizer=tokenizer,
-        model=esm_model,
-        device=device,
-        atom_name=DIST_TYPE,
-        max_seq_len=MAX_SEQ_LEN,
-        emb_size=ESM_DIM,
-        sigma_dist=SIGMA_DIST,
-        batch_size=batch_size,
-        file_names=file_names,
-    )
+    if from_fasta:
+        batch_iterator = prepare_batches_from_fasta(
+            input_path,
+            tokenizer=tokenizer,
+            model=esm_model,
+            device=device,
+            max_seq_len=MAX_SEQ_LEN,
+            emb_size=ESM_DIM,
+            sigma_dist=SIGMA_DIST,
+            batch_size=batch_size,
+        )
+    else:
+        batch_iterator = prepare_batches_for_inference(
+            input_path,
+            tokenizer=tokenizer,
+            model=esm_model,
+            device=device,
+            atom_name=DIST_TYPE,
+            max_seq_len=MAX_SEQ_LEN,
+            emb_size=ESM_DIM,
+            sigma_dist=SIGMA_DIST,
+            batch_size=batch_size,
+            file_names=file_names,
+            model_type=model,
+        )
 
     for batch_idx, batch in enumerate(batch_iterator, start=1):
         batch_ids, embeddings_batch, distograms_batch, masks_batch = batch
@@ -304,22 +354,20 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 batch_ids=batch_ids,
                 batch_idx=batch_idx,
                 ontology=ontology,
+                model_type=model,
             )
             inference_elapsed += time.perf_counter() - inference_start
 
-            batch_records = [
-                {
-                    "protein_id": protein_id,
-                    "ontology": ontology,
-                    "pred_proba": probs,
-                    "pred_proba_struct": probs_struct,
-                    "pred_proba_seq": probs_seq,
-                    "pred_gate": gate_vals,
-                }
-                for protein_id, probs, probs_struct, probs_seq, gate_vals in zip(
-                    batch_ids, preds, preds_struct, preds_seq, gate
-                )
-            ]
+            # pred_proba holds the selected model's output. For fusion, also carry the structure
+            # and sequence sub-branch probabilities and the gate; standalone models carry only their own.
+            batch_records = []
+            for i, protein_id in enumerate(batch_ids):
+                record = {"protein_id": protein_id, "ontology": ontology, "pred_proba": preds[i]}
+                if model == "fusion":
+                    record["pred_proba_struct"] = preds_struct[i]
+                    record["pred_proba_seq"] = preds_seq[i]
+                    record["pred_gate"] = gate[i]
+                batch_records.append(record)
             # GO-hierarchy propagation is only computed when requested (--prop).
             propagated_batch_records = (
                 [propagate_prediction_record(record, descendant_indices) for record in batch_records]
@@ -328,15 +376,17 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
             )
 
             # Per-protein raw table (fusion / structure / sequence branches), plus the
-            # propagated table when propagation is enabled.
-            for i, record in enumerate(batch_records):
-                build_all_prediction_table([record], mapping).to_csv(
-                    preds_dir / f"{record['protein_id']}__{ontology}.csv", index=False
-                )
-                if prop:
-                    build_propagated_prediction_table([propagated_batch_records[i]], mapping).to_csv(
-                        preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
+            # propagated table when propagation is enabled. Skipped entirely with --summary
+            # (propagation is still computed above so the summary keeps its propagated columns).
+            if not summary_only:
+                for i, record in enumerate(batch_records):
+                    build_all_prediction_table([record], mapping, model_type=model).to_csv(
+                        preds_dir / f"{record['protein_id']}__{ontology}.csv", index=False
                     )
+                    if prop:
+                        build_propagated_prediction_table([propagated_batch_records[i]], mapping, model_type=model).to_csv(
+                            preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
+                        )
 
             # Summary rows: keep a term if any branch (fusion / structure / sequence)
             # passes the threshold. Collected per aspect, written out below per batch.
@@ -347,6 +397,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 top_k=top_k,
                 go_name_map=go_name_map,
                 propagated_records=propagated_batch_records,
+                model_type=model,
             )
             summary.insert(0, "ontology", ontology)
             batch_summaries.append(summary)
@@ -377,7 +428,9 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
 
     log_timing("Inference time", inference_elapsed, total_proteins, "protein")
     log_timing("Total time", time.perf_counter() - start, total_proteins, "protein")
-    if prop:
+    if summary_only:
+        logger.info("Summary-only mode: per-protein tables not written")
+    elif prop:
         logger.info(f"Wrote per-protein tables to {preds_dir} and {preds_propagated_dir}")
     else:
         logger.info(f"Wrote per-protein tables to {preds_dir}")
@@ -435,8 +488,10 @@ def parse_args(argv=None):
         description="deepFRI2 inference: predict GO terms for protein structures.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--input_dir", "-i", type=Path, required=True,
-                        help="Folder with protein structures (.cif / .pdb).")
+    parser.add_argument("--input", "-i", type=Path, required=True, dest="input",
+                        help="Either a folder with protein structures (.cif / .pdb) or a single "
+                             "FASTA file of sequences. A FASTA input runs the sequence model only "
+                             "(--model and --ids_file are ignored; --threshold uses its first value).")
     parser.add_argument("--output_dir", "-o", type=Path, default=None,
                         help="Folder for results (default: <repo>/results).")
     parser.add_argument("--ids_file", "-f", type=Path, default=None,
@@ -444,8 +499,14 @@ def parse_args(argv=None):
                              "e.g. 'abCD.cif' or 'abCD'); default: all files in input_dir.")
     parser.add_argument("--aspect", "-a", type=parse_aspect, default=list(ONTOLOGIES),
                         metavar="MF,CC,BP",
-                        help="Comma-separated GO aspects (models) to run: any of MF, CC, BP "
+                        help="Comma-separated GO aspects (ontologies) to run: any of MF, CC, BP "
                              "(case-insensitive). Default: mf,cc,bp.")
+    parser.add_argument("--model", "-m", type=str.lower, choices=("sequence", "structure", "fusion"),
+                        default="fusion",
+                        help="Which model to run: 'sequence' (embeddings only), 'structure' "
+                             "(distograms only) or 'fusion' (both). Only the needed inputs are "
+                             "computed and the outputs carry only that model's columns "
+                             "(default: fusion).")
     parser.add_argument("--batch_size", "-b", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Proteins per inference batch (default: {DEFAULT_BATCH_SIZE}).")
     parser.add_argument("--threshold", "-t", type=parse_threshold, default=DEFAULT_THRESHOLD,
@@ -459,6 +520,10 @@ def parse_args(argv=None):
     parser.add_argument("--prop", "-p", action="store_true",
                         help="Propagate scores up the GO hierarchy (default: off); also writes "
                              "the preds_propagated/ folder and the propagated summary columns.")
+    parser.add_argument("--summary", "-s", action="store_true",
+                        help="Write only prediction_summary.csv, skipping the preds/ (and "
+                             "preds_propagated/) folders (default: off). With --prop, the summary "
+                             "still includes the propagated columns.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging (e.g. per-checkpoint weight-load report).")
     return parser.parse_args(argv)
@@ -471,55 +536,94 @@ def main(argv=None):
     # appears before the logging output even when stdout is piped/redirected.
     print(BANNER, flush=True)
 
-    # Heavy dependencies are imported only now, after argument parsing, so `--help`
-    # and argument errors return without paying the torch/transformers import cost.
-    import torch
     from utils import build_go_descendant_indices, configure_log_file
 
-    # Console logging; --verbose lowers the level to DEBUG. Per-run file logging is
-    # attached below (the file handler is at INFO, so it stays clean of debug noise).
+    # Console and per-run file logging share the same level; --verbose lowers both to DEBUG so the
+    # debug output is captured in log.txt as well as on screen.
+    log_level = DEBUG if args.verbose else INFO
     basicConfig(
-        level=DEBUG if args.verbose else INFO,
+        level=log_level,
         format="%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%H:%M:%S",
         force=True,
     )
 
-    input_dir = args.input_dir
+    input_path = args.input
     output_dir = args.output_dir if args.output_dir is not None else REPO_ROOT / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
-    configure_log_file(output_dir / "log.txt")
+    configure_log_file(output_dir / "log.txt", level=log_level)
+
+    # Record the exact command that launched this run, so log.txt is self-contained.
+    logger.info(f"Command         : {shlex.join([sys.executable, *sys.argv])}")
+
+    # A directory input runs structures; a single file input is read as FASTA and runs the
+    # sequence model only (so --model and --ids_file don't apply).
+    if not input_path.exists():
+        _fatal(f"Input does not exist: {input_path}")
+    if input_path.is_file() and input_path.suffix.lower() in (".cif", ".pdb"):
+        _fatal(f"--input is a single structure file: {input_path}. Put structures in a directory "
+               f"(a single-file input is read as a FASTA of sequences).")
+    from_fasta = input_path.is_file()
+    model = "sequence" if from_fasta else args.model
+
+    # Heavy dependencies are imported only now, after argument parsing, so `--help`
+    # and argument errors return without paying the torch/transformers import cost.
+    logger.info("Loading torch...")
+    import torch
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Report the full run configuration up front for transparency.
-    ids_file = args.ids_file if args.ids_file is not None else "None (all structures in input dir)"
     top_k = args.top_k if args.top_k is not None else "all"
     threshold_fs, threshold_struct = args.threshold
     aspects = args.aspect
-    logger.info(f"deepFRI2 version : {config_version()}")
-    logger.info(f"Input dir       : {input_dir}")
+    logger.info(f"Model version   : {config_version()}")
+    logger.info(f"Input           : {input_path} ({'FASTA sequences' if from_fasta else 'structure directory'})")
     logger.info(f"Output dir      : {output_dir}")
-    logger.info(f"IDs file        : {ids_file}")
+    if from_fasta:
+        if args.ids_file is not None:
+            logger.warning("--ids_file is ignored for FASTA input; all sequences are used.")
+        logger.info("Model           : sequence (FASTA input; --model not applicable)")
+        logger.info(f"Threshold       : seq={threshold_fs}")
+    else:
+        ids_file = args.ids_file if args.ids_file is not None else "None (all structures in input dir)"
+        logger.info(f"IDs file        : {ids_file}")
+        logger.info(f"Model           : {model}")
+        # Single models use a single threshold (structure -> the structure value, sequence -> the
+        # first value); only fusion uses the two-value pair (one per branch).
+        if model == "structure":
+            logger.info(f"Threshold       : struct={threshold_struct}")
+        elif model == "sequence":
+            logger.info(f"Threshold       : seq={threshold_fs}")
+        else:
+            logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
     logger.info(f"Aspects         : {', '.join(aspects)}")
     logger.info(f"Batch size      : {args.batch_size}")
-    logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
     logger.info(f"Top k           : {top_k}")
     logger.info(f"Propagate       : {args.prop}")
+    logger.info(f"Summary only    : {args.summary}")
     logger.info(f"Verbose         : {args.verbose}")
     logger.info(f"Device          : {device}")
 
-    # Validate inputs before any heavy work: on fatal problems (missing/empty input dir
-    # or ids file, or no matching ids) this logs an ERROR and terminates without running.
-    validate_input_dir(input_dir)
-    file_names = resolve_file_names(input_dir, args.ids_file)
+    # Validate inputs before any heavy work. For a structure directory this can terminate on
+    # missing/empty dir or ids; for FASTA the reader itself warns about empty/duplicate entries.
+    if from_fasta:
+        file_names = None
+    else:
+        validate_input_dir(input_path, require_structures=args.ids_file is None)
+        file_names = resolve_file_names(input_path, args.ids_file)
 
     go_terms_mappings = load_go_terms_mappings(PARAMS_DIR)
     num_labels_by_ontology = {ont: len(m) for ont, m in go_terms_mappings.items()}
 
-    tokenizer, esm_model = load_esm(device, PARAMS_DIR)
-    # Build only the requested aspect models (--aspect).
-    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects)
+    # ESM embeddings are only needed by the sequence and fusion models; the structure model
+    # reads only distograms, so skip loading ESM entirely for it.
+    if model in ("sequence", "fusion"):
+        tokenizer, esm_model = load_esm(device, PARAMS_DIR)
+    else:
+        tokenizer, esm_model = None, None
+    # Build only the requested aspect models (--aspect), for the selected model type.
+    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects, model_type=model)
 
     go_graph, go_name_map = load_go_name_map(PARAMS_DIR / f"go_{GO_VERSION}.obo")
     # GO-hierarchy descendant indices are only needed for propagation (--prop), and only
@@ -534,10 +638,11 @@ def main(argv=None):
     )
 
     run_inference(
-        input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
+        input_path, output_dir, file_names, models, tokenizer, esm_model, device,
         go_terms_mappings, descendant_indices_by_ontology, go_name_map,
         batch_size=args.batch_size, threshold=args.threshold, top_k=args.top_k,
-        prop=args.prop, aspects=aspects,
+        prop=args.prop, aspects=aspects, summary_only=args.summary, model=model,
+        from_fasta=from_fasta,
     )
     logger.info("Done.")
 
