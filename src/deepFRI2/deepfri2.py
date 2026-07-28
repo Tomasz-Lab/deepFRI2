@@ -58,6 +58,8 @@ head checkpoints are expected under ``params/<ontology>/``.
 
 import argparse
 import json
+import shlex
+import sys
 import time
 from logging import DEBUG, INFO, basicConfig, getLogger
 from pathlib import Path
@@ -536,10 +538,11 @@ def main(argv=None):
 
     from utils import build_go_descendant_indices, configure_log_file
 
-    # Console logging; --verbose lowers the level to DEBUG. Per-run file logging is
-    # attached below (the file handler is at INFO, so it stays clean of debug noise).
+    # Console and per-run file logging share the same level; --verbose lowers both to DEBUG so the
+    # debug output is captured in log.txt as well as on screen.
+    log_level = DEBUG if args.verbose else INFO
     basicConfig(
-        level=DEBUG if args.verbose else INFO,
+        level=log_level,
         format="%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%H:%M:%S",
         force=True,
@@ -548,7 +551,10 @@ def main(argv=None):
     input_path = args.input
     output_dir = args.output_dir if args.output_dir is not None else REPO_ROOT / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
-    configure_log_file(output_dir / "log.txt")
+    configure_log_file(output_dir / "log.txt", level=log_level)
+
+    # Record the exact command that launched this run, so log.txt is self-contained.
+    logger.info(f"Command         : {shlex.join([sys.executable, *sys.argv])}")
 
     # A directory input runs structures; a single file input is read as FASTA and runs the
     # sequence model only (so --model and --ids_file don't apply).

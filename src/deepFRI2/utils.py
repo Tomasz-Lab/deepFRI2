@@ -241,7 +241,9 @@ def set_console_logging(enabled=True):
         _console_handlers = []
 
 
-def configure_log_file(log_path):
+def configure_log_file(log_path, level=INFO):
+    """Attach a per-run file handler writing to ``log_path``. ``level`` should match the console
+    verbosity (pass DEBUG under --verbose so debug output is captured in the file too)."""
     root_logger = logging.getLogger()
     formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%H:%M:%S")
     for handler in list(root_logger.handlers):
@@ -249,7 +251,7 @@ def configure_log_file(log_path):
             root_logger.removeHandler(handler)
             handler.close()
     file_handler = logging.FileHandler(log_path, mode="w")
-    file_handler.setLevel(INFO)
+    file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     file_handler._deepfri_log_file = True
     root_logger.addHandler(file_handler)
