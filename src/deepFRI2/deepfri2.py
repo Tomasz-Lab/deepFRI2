@@ -17,8 +17,11 @@ Inputs
                         and/or a relative subfolder path (``abCD``, ``abCD.cif``, ``sub/abCD``,
                         ``sub1/sub2/abCD.cif``); resolved under ``--input_dir``. If omitted,
                         every top-level structure in ``--input_dir`` is processed.
-    --aspect     / -a : comma-separated GO aspects (models) to run: any of MF, CC, BP
+    --aspect     / -a : comma-separated GO aspects (ontologies) to run: any of MF, CC, BP
                         (case-insensitive). Default: mf,cc,bp.
+    --model      / -m : which model to run: ``sequence`` (embeddings only), ``structure``
+                        (distograms only) or ``fusion`` (both). Only the needed inputs are
+                        computed and outputs carry only that model's columns. Default: fusion.
     --batch_size / -b : proteins per inference batch (default: 32).
     --threshold  / -t : one float (applied to all branches) or two comma-separated floats
                         (fusion/sequence, structure) for keeping GO terms in the summary
@@ -33,15 +36,15 @@ Inputs
                         the summary still gets the propagated columns.
     --verbose    / -v : enable debug logging (e.g. per-checkpoint weight-load report).
 
-Output (under <output_dir>; same as inference.ipynb)
+Output (under <output_dir>)
 ------
-    preds/<protein>__<ontology>.csv            : all GO terms with raw fusion / structure /
-                                                 sequence probabilities and the gate (omitted with --summary).
-    preds_propagated/<protein>__<ontology>.csv : all GO terms with hierarchically-propagated
-                                                 source terms and probabilities (only with --prop, and
+    preds/<protein>__<ontology>.csv            : per-term probabilities for the selected --model
+                                                 (fusion also carries struct/seq probs + gate;
                                                  omitted with --summary).
-    prediction_summary.csv                     : thresholded / top-k predictions per protein
-                                                 across all ontologies (raw, plus propagated
+    preds_propagated/<protein>__<ontology>.csv : per-term hierarchically-propagated source terms and
+                                                 probabilities (only with --prop; omitted with --summary).
+    prediction_summary.csv                     : thresholded / top-k predictions per protein across all
+                                                 ontologies (selected-model columns, plus propagated
                                                  columns only with --prop).
     log.txt                                    : run log.
 
@@ -141,8 +144,8 @@ def load_esm(device, params_dir):
     return tokenizer, model
 
 
-def load_models(device, num_labels_by_ontology, params_dir, ontologies=None):
-    """Build and load a deepFRI2 fusion model for each requested ontology (default: all)."""
+def load_models(device, num_labels_by_ontology, params_dir, ontologies=None, model_type="fusion"):
+    """Build and load a deepFRI2 model (``model_type``: fusion/structure/sequence) per ontology."""
     from model import build_deepfri2_model
 
     ontologies = list(ONTOLOGIES) if ontologies is None else list(ontologies)
@@ -158,10 +161,11 @@ def load_models(device, num_labels_by_ontology, params_dir, ontologies=None):
             m_anti=M_ANTI,
             num_diag=NUM_DIAG,
             num_anti=NUM_ANTI,
+            model_type=model_type,
         )
         for ontology in ontologies
     }
-    logger.info(f"deepFRI2 models loaded: {', '.join(ontologies)}")
+    logger.info(f"deepFRI2 {model_type} model(s) loaded: {', '.join(ontologies)}")
     return models
 
 
@@ -243,11 +247,13 @@ def validate_input_dir(input_dir, require_structures=True):
 
 def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_model,
                   device, go_terms_mappings, descendant_indices_by_ontology, go_name_map,
-                  batch_size, threshold, top_k, prop=False, aspects=None, summary_only=False):
-    """Run all-ontology inference and write the same outputs as inference.ipynb.
+                  batch_size, threshold, top_k, prop=False, aspects=None, summary_only=False,
+                  model="fusion"):
+    """Run inference for the selected model (fusion/structure/sequence) and write outputs.
 
     Produces, under ``output_dir``:
-    - ``preds/<protein>__<ontology>.csv``            (raw fusion / structure / sequence probs + gate)
+    - ``preds/<protein>__<ontology>.csv``            (per-term probabilities for the selected model;
+                                                      fusion also includes struct/seq probs + gate)
     - ``prediction_summary.csv``                     (thresholded / top-k summary across ontologies)
 
     When ``prop`` is True, GO-hierarchy propagation is run as well, which additionally produces:
@@ -302,6 +308,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
         sigma_dist=SIGMA_DIST,
         batch_size=batch_size,
         file_names=file_names,
+        model_type=model,
     )
 
     for batch_idx, batch in enumerate(batch_iterator, start=1):
@@ -324,22 +331,20 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 batch_ids=batch_ids,
                 batch_idx=batch_idx,
                 ontology=ontology,
+                model_type=model,
             )
             inference_elapsed += time.perf_counter() - inference_start
 
-            batch_records = [
-                {
-                    "protein_id": protein_id,
-                    "ontology": ontology,
-                    "pred_proba": probs,
-                    "pred_proba_struct": probs_struct,
-                    "pred_proba_seq": probs_seq,
-                    "pred_gate": gate_vals,
-                }
-                for protein_id, probs, probs_struct, probs_seq, gate_vals in zip(
-                    batch_ids, preds, preds_struct, preds_seq, gate
-                )
-            ]
+            # pred_proba holds the selected model's output. For fusion, also carry the structure
+            # and sequence sub-branch probabilities and the gate; standalone models carry only their own.
+            batch_records = []
+            for i, protein_id in enumerate(batch_ids):
+                record = {"protein_id": protein_id, "ontology": ontology, "pred_proba": preds[i]}
+                if model == "fusion":
+                    record["pred_proba_struct"] = preds_struct[i]
+                    record["pred_proba_seq"] = preds_seq[i]
+                    record["pred_gate"] = gate[i]
+                batch_records.append(record)
             # GO-hierarchy propagation is only computed when requested (--prop).
             propagated_batch_records = (
                 [propagate_prediction_record(record, descendant_indices) for record in batch_records]
@@ -352,11 +357,11 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
             # (propagation is still computed above so the summary keeps its propagated columns).
             if not summary_only:
                 for i, record in enumerate(batch_records):
-                    build_all_prediction_table([record], mapping).to_csv(
+                    build_all_prediction_table([record], mapping, model_type=model).to_csv(
                         preds_dir / f"{record['protein_id']}__{ontology}.csv", index=False
                     )
                     if prop:
-                        build_propagated_prediction_table([propagated_batch_records[i]], mapping).to_csv(
+                        build_propagated_prediction_table([propagated_batch_records[i]], mapping, model_type=model).to_csv(
                             preds_propagated_dir / f"{record['protein_id']}__{ontology}.csv", index=False
                         )
 
@@ -369,6 +374,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
                 top_k=top_k,
                 go_name_map=go_name_map,
                 propagated_records=propagated_batch_records,
+                model_type=model,
             )
             summary.insert(0, "ontology", ontology)
             batch_summaries.append(summary)
@@ -468,8 +474,14 @@ def parse_args(argv=None):
                              "e.g. 'abCD.cif' or 'abCD'); default: all files in input_dir.")
     parser.add_argument("--aspect", "-a", type=parse_aspect, default=list(ONTOLOGIES),
                         metavar="MF,CC,BP",
-                        help="Comma-separated GO aspects (models) to run: any of MF, CC, BP "
+                        help="Comma-separated GO aspects (ontologies) to run: any of MF, CC, BP "
                              "(case-insensitive). Default: mf,cc,bp.")
+    parser.add_argument("--model", "-m", type=str.lower, choices=("sequence", "structure", "fusion"),
+                        default="fusion",
+                        help="Which model to run: 'sequence' (embeddings only), 'structure' "
+                             "(distograms only) or 'fusion' (both). Only the needed inputs are "
+                             "computed and the outputs carry only that model's columns "
+                             "(default: fusion).")
     parser.add_argument("--batch_size", "-b", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Proteins per inference batch (default: {DEFAULT_BATCH_SIZE}).")
     parser.add_argument("--threshold", "-t", type=parse_threshold, default=DEFAULT_THRESHOLD,
@@ -532,8 +544,16 @@ def main(argv=None):
     logger.info(f"Output dir      : {output_dir}")
     logger.info(f"IDs file        : {ids_file}")
     logger.info(f"Aspects         : {', '.join(aspects)}")
+    logger.info(f"Model           : {args.model}")
     logger.info(f"Batch size      : {args.batch_size}")
-    logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
+    # Single models use a single threshold (structure -> the structure value, sequence -> the
+    # first value); only fusion uses the two-value pair (one per branch).
+    if args.model == "structure":
+        logger.info(f"Threshold       : struct={threshold_struct}")
+    elif args.model == "sequence":
+        logger.info(f"Threshold       : seq={threshold_fs}")
+    else:
+        logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
     logger.info(f"Top k           : {top_k}")
     logger.info(f"Propagate       : {args.prop}")
     logger.info(f"Summary only    : {args.summary}")
@@ -548,9 +568,14 @@ def main(argv=None):
     go_terms_mappings = load_go_terms_mappings(PARAMS_DIR)
     num_labels_by_ontology = {ont: len(m) for ont, m in go_terms_mappings.items()}
 
-    tokenizer, esm_model = load_esm(device, PARAMS_DIR)
-    # Build only the requested aspect models (--aspect).
-    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects)
+    # ESM embeddings are only needed by the sequence and fusion models; the structure model
+    # reads only distograms, so skip loading ESM entirely for it.
+    if args.model in ("sequence", "fusion"):
+        tokenizer, esm_model = load_esm(device, PARAMS_DIR)
+    else:
+        tokenizer, esm_model = None, None
+    # Build only the requested aspect models (--aspect), for the selected model type (--model).
+    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects, model_type=args.model)
 
     go_graph, go_name_map = load_go_name_map(PARAMS_DIR / f"go_{GO_VERSION}.obo")
     # GO-hierarchy descendant indices are only needed for propagation (--prop), and only
@@ -568,7 +593,7 @@ def main(argv=None):
         input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
         go_terms_mappings, descendant_indices_by_ontology, go_name_map,
         batch_size=args.batch_size, threshold=args.threshold, top_k=args.top_k,
-        prop=args.prop, aspects=aspects, summary_only=args.summary,
+        prop=args.prop, aspects=aspects, summary_only=args.summary, model=args.model,
     )
     logger.info("Done.")
 

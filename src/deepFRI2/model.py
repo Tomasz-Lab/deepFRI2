@@ -1068,7 +1068,22 @@ class FusionModel(nn.Module):
         use_diag: Optional[bool] = None,
         use_anti: Optional[bool] = None,
         return_details: bool = False,
+        return_branches: bool = False,
     ):
+        # Fast path for inference that needs the per-branch logits and the gate but NOT the
+        # (expensive, discarded) per-residue attribution: run the kernel with return_attr=False.
+        if return_branches and not return_attr and not return_details:
+            with torch.no_grad():
+                logits_struct = self.kernel(inputs, disto, mask, return_attr=False,
+                                            use_diag=use_diag, use_anti=use_anti)
+                logits_esm, attr_esm = self.esm(inputs, disto, mask, return_attr=True)
+            x_gate = attr_esm.get(self.gate_input, None)
+            if x_gate is None:
+                raise ValueError(f"Fusion Model gate requires attr_esm['{self.gate_input}']")
+            gate = torch.sigmoid(self.refine_gate(x_gate.detach()))
+            logits = gate * logits_esm.detach() + (1 - gate) * logits_struct
+            return logits, logits_struct, logits_esm, gate
+
         if return_details:
             k_out = self.kernel(
                 inputs,
@@ -1171,12 +1186,17 @@ def build_deepfri2_model(
     attn_temperature=2.0,
     gate_input="hidden",
     gate_init_bias=-3.0,
+    model_type="fusion",
 ):
-    """Build a frozen deepFRI2 ``FusionModel`` for one ontology and load its weights.
+    """Build a deepFRI2 model for one ontology and load its weights.
 
-    Assembles a ``StructuralProber`` and a ``SequenceAnalyzer``, loads each sub-model's
-    checkpoint, wraps them in a ``FusionModel``, loads the fusion checkpoint, and returns
-    the model in eval mode on ``device``. Architecture hyperparameters default to the
+    ``model_type`` selects which model to build and which checkpoint(s) to load:
+    - ``"fusion"`` (default): a frozen ``FusionModel`` wrapping a ``StructuralProber`` and a
+      ``SequenceAnalyzer`` (loads the structure, sequence and fusion checkpoints).
+    - ``"structure"``: just the ``StructuralProber`` (loads only the structure checkpoint).
+    - ``"sequence"``: just the ``SequenceAnalyzer`` (loads only the sequence checkpoint).
+
+    Returns the model in eval mode on ``device``. Architecture hyperparameters default to the
     values used to train the released deepFRI2 checkpoints; override them only if loading
     differently-trained weights.
 
@@ -1189,44 +1209,55 @@ def build_deepfri2_model(
         esm_dim: ESM embedding dimension.
         m_diag / m_anti: diagonal / off-diagonal kernel sizes.
         num_diag / num_anti: number of diagonal / off-diagonal kernels.
+        model_type: ``"fusion"`` (default), ``"structure"`` or ``"sequence"``.
         (remaining args): fixed architecture hyperparameters of the released checkpoints.
     """
-    arch_to_size_diag = {f"diag_{i}": m_diag for i in range(1, num_diag + 1)}
-    arch_to_size_anti = {f"anti_{i}": m_anti for i in range(1, num_anti + 1)}
+    if model_type not in ("fusion", "structure", "sequence"):
+        raise ValueError(f"model_type must be 'fusion', 'structure' or 'sequence', got {model_type!r}")
 
-    structure_model = StructuralProber(
-        num_labels=num_labels,
-        arch_to_size_diag=arch_to_size_diag,
-        arch_to_size_anti=arch_to_size_anti,
-        canonical_diag_ms=m_diag,
-        diag_stride=diag_stride,
-        canonical_anti_ms=m_anti,
-        anti_stride=anti_stride,
-        diag_feats=diag_feats,
-        anti_feats=anti_feats,
-        peak_thresh=peak_thresh,
-        topk_k=topk_k,
-        frozen_kernels=False,
-        amp_dtype=torch.bfloat16,
-        enforce_symmetry_diag=True,
-        enforce_symmetry_anti=False,
-        enforce_positivity_diag=False,
-        enforce_positivity_anti=False,
-    )
-    sequence_model = SequenceAnalyzer(
-        num_labels=num_labels,
-        hidden_dim=hidden_dim,
-        pooling_method="attn_light",
-        emb_size=esm_dim,
-        attn_hidden=attn_hidden,
-        attn_temperature=attn_temperature,
-    )
-    structure_model = load_run_weights(structure_model, ontology, run_names["structure"], strict=False, params_dir=params_dir)
-    sequence_model = load_run_weights(sequence_model, ontology, run_names["sequence"], strict=False, params_dir=params_dir)
+    def _build_structure():
+        arch_to_size_diag = {f"diag_{i}": m_diag for i in range(1, num_diag + 1)}
+        arch_to_size_anti = {f"anti_{i}": m_anti for i in range(1, num_anti + 1)}
+        m = StructuralProber(
+            num_labels=num_labels,
+            arch_to_size_diag=arch_to_size_diag,
+            arch_to_size_anti=arch_to_size_anti,
+            canonical_diag_ms=m_diag,
+            diag_stride=diag_stride,
+            canonical_anti_ms=m_anti,
+            anti_stride=anti_stride,
+            diag_feats=diag_feats,
+            anti_feats=anti_feats,
+            peak_thresh=peak_thresh,
+            topk_k=topk_k,
+            frozen_kernels=False,
+            amp_dtype=torch.bfloat16,
+            enforce_symmetry_diag=True,
+            enforce_symmetry_anti=False,
+            enforce_positivity_diag=False,
+            enforce_positivity_anti=False,
+        )
+        return load_run_weights(m, ontology, run_names["structure"], strict=False, params_dir=params_dir)
+
+    def _build_sequence():
+        m = SequenceAnalyzer(
+            num_labels=num_labels,
+            hidden_dim=hidden_dim,
+            pooling_method="attn_light",
+            emb_size=esm_dim,
+            attn_hidden=attn_hidden,
+            attn_temperature=attn_temperature,
+        )
+        return load_run_weights(m, ontology, run_names["sequence"], strict=False, params_dir=params_dir)
+
+    if model_type == "structure":
+        return _build_structure().eval().to(device)
+    if model_type == "sequence":
+        return _build_sequence().eval().to(device)
 
     fusion_model = FusionModel(
-        structure_model=structure_model,
-        esm_model=sequence_model,
+        structure_model=_build_structure(),
+        esm_model=_build_sequence(),
         gate_input=gate_input,
         gate_init_bias=gate_init_bias,
     )

@@ -704,6 +704,7 @@ def prepare_batches_for_inference(
     file_names=None,
     preprocessing=True,
     return_struct_info=False,
+    model_type="fusion",
 ):
     """Parse structures, compute distograms + ESM embeddings, and yield batches.
 
@@ -718,6 +719,8 @@ def prepare_batches_for_inference(
             are skipped. When None, every top-level structure in ``struct_path`` is used.
         preprocessing: if True, pad/process into stacked tensors; otherwise yield raw arrays.
         return_struct_info: if True, also yield per-protein structure metadata.
+        model_type: which model the inputs are for. ``"fusion"`` computes both distograms and
+            embeddings; ``"structure"`` computes only distograms; ``"sequence"`` only embeddings.
 
     Yields:
         ``(batch_ids, embeddings, distograms, masks)`` tuples (plus struct info if requested).
@@ -788,26 +791,38 @@ def prepare_batches_for_inference(
         coords = [item['coords'] for item in parsed_items]
         sequences_in_order = [item['sequence'] for item in parsed_items]
 
-        distogram_start = time.perf_counter()
-        distograms = generate_distograms_for_list(coords, show_progress=False, log_start=False)
-        distogram_batch_elapsed = time.perf_counter() - distogram_start
-        distogram_elapsed += distogram_batch_elapsed
-        log_timing(f"Distograms batch {chunk_idx:>3}", distogram_batch_elapsed, len(parsed_items), "protein")
+        # Only compute the inputs the selected model needs: the structure model uses distograms,
+        # the sequence model uses ESM embeddings, fusion uses both.
+        need_disto = model_type in ("fusion", "structure")
+        need_emb = model_type in ("fusion", "sequence")
 
-        embedding_start = time.perf_counter()
-        embeddings = generate_embeddings_for_list(
-            sequences_in_order, tokenizer, model, device, show_progress=False, log_start=False
-        )
-        embedding_batch_elapsed = time.perf_counter() - embedding_start
-        embedding_elapsed += embedding_batch_elapsed
-        log_timing(f"Embeddings batch {chunk_idx:>3}", embedding_batch_elapsed, len(parsed_items), "protein")
+        if need_disto:
+            distogram_start = time.perf_counter()
+            distograms = generate_distograms_for_list(coords, show_progress=False, log_start=False)
+            distogram_batch_elapsed = time.perf_counter() - distogram_start
+            distogram_elapsed += distogram_batch_elapsed
+            log_timing(f"Distograms batch {chunk_idx:>3}", distogram_batch_elapsed, len(parsed_items), "protein")
+        else:
+            distograms = [None] * len(parsed_items)
+
+        if need_emb:
+            embedding_start = time.perf_counter()
+            embeddings = generate_embeddings_for_list(
+                sequences_in_order, tokenizer, model, device, show_progress=False, log_start=False
+            )
+            embedding_batch_elapsed = time.perf_counter() - embedding_start
+            embedding_elapsed += embedding_batch_elapsed
+            log_timing(f"Embeddings batch {chunk_idx:>3}", embedding_batch_elapsed, len(parsed_items), "protein")
+        else:
+            embeddings = [None] * len(parsed_items)
 
         assert len(distograms) == len(embeddings) == len(parsed_items)
-        for item, distogram, embedding in zip(parsed_items, distograms, embeddings):
-            assert distogram.shape[0] == embedding.shape[0] - 2, (
-                f"Length mismatch for {item['protein_id']}: distogram {distogram.shape[0]} vs "
-                f"embedding L={embedding.shape[0]} (expect L-2 == n residues)"
-            )
+        if need_disto and need_emb:
+            for item, distogram, embedding in zip(parsed_items, distograms, embeddings):
+                assert distogram.shape[0] == embedding.shape[0] - 2, (
+                    f"Length mismatch for {item['protein_id']}: distogram {distogram.shape[0]} vs "
+                    f"embedding L={embedding.shape[0]} (expect L-2 == n residues)"
+                )
 
         batching_start = time.perf_counter()
         batch_embeddings = []
@@ -879,23 +894,37 @@ def inference_for_batch(
     batch_ids=None,
     batch_idx=None,
     ontology=None,
+    model_type="fusion",
     return_attr=True,
 ):
+    """Run one batch through the selected model and return ``(preds, preds_struct, preds_seq, gate)``.
+
+    For ``model_type='fusion'`` all four are arrays (fusion prediction plus its structure/sequence
+    sub-branch probabilities and the gate). For ``'structure'`` / ``'sequence'`` only the chosen
+    model runs: ``preds`` holds its probabilities and the other three are None.
+    """
     start = time.perf_counter()
-    logits, logits_struct, logits_esm, gate, _, _, _ = model_(
-        embeddings_batch, distograms_batch, masks_batch, return_attr=return_attr
-    )
-    preds = logits.sigmoid().detach().cpu().numpy()
-    preds_struct = logits_struct.sigmoid().detach().cpu().numpy()
-    preds_seq = logits_esm.sigmoid().detach().cpu().numpy()
-    gate_np = gate.detach().cpu().numpy()
+    if model_type == "fusion":
+        # return_branches gives the fusion + structure + sequence logits and the gate without the
+        # StructuralProber's per-residue attribution
+        logits, logits_struct, logits_esm, gate = model_(
+            embeddings_batch, distograms_batch, masks_batch, return_branches=True
+        )
+        preds = logits.sigmoid().detach().cpu().numpy()
+        preds_struct = logits_struct.sigmoid().detach().cpu().numpy()
+        preds_seq = logits_esm.sigmoid().detach().cpu().numpy()
+        gate_np = gate.detach().cpu().numpy()
+        result = (preds, preds_struct, preds_seq, gate_np)
+    else:
+        logits = model_(embeddings_batch, distograms_batch, masks_batch)
+        result = (logits.sigmoid().detach().cpu().numpy(), None, None, None)
     elapsed = time.perf_counter() - start
 
     ont_prefix = f"{ontology} " if ontology is not None else ""
     batch_label = f"{ont_prefix}Inference batch {batch_idx:>3}" if batch_idx is not None else f"{ont_prefix}Inference batch"
     batch_size = len(batch_ids) if batch_ids is not None else embeddings_batch.shape[0]
     log_timing(batch_label, elapsed, batch_size, "protein")
-    return preds, preds_struct, preds_seq, gate_np
+    return result
 
 
 def extract_go_terms_from_preds(mapping: dict[str, int],
@@ -1020,59 +1049,71 @@ def _resolve_go_name(go_term, go_name_map):
     return "" if value is None or (isinstance(value, float) and not np.isfinite(value)) else str(value)
 
 
-def build_all_prediction_table(protein_records, go_terms_mapping):
-    """Per-GO-term table of raw probabilities for the fusion / structure / sequence branches.
+# Primary output column names per model: (probability, propagated-source-id, propagated-probability).
+# Fusion's primary is the fusion score; standalone models name their column after the branch.
+_PRIMARY_COLS = {
+    "fusion": ("pred_prob", "prop_go_id", "pred_prop_prob"),
+    "structure": ("struct_prob", "struct_prop_go_id", "struct_prop_prob"),
+    "sequence": ("seq_prob", "seq_prop_go_id", "seq_prop_prob"),
+}
 
-    Columns: go_id, pred_prob (fusion), struct_prob, seq_prob (sequence), gate.
+
+def build_all_prediction_table(protein_records, go_terms_mapping, model_type="fusion"):
+    """Per-GO-term table of raw probabilities for the selected model.
+
+    The primary probability column is named for the model: ``pred_prob`` (fusion), ``struct_prob``
+    (structure) or ``seq_prob`` (sequence). A fusion record additionally carries the structure and
+    sequence sub-branch columns (struct_prob, seq_prob) and the gate.
     """
+    prob_col = _PRIMARY_COLS[model_type][0]
     rows = []
     for record in protein_records:
         probs = np.asarray(record["pred_proba"], dtype=np.float32)
-        struct_probs = np.asarray(record["pred_proba_struct"], dtype=np.float32)
-        seq_probs = np.asarray(record["pred_proba_seq"], dtype=np.float32)
+        struct_probs = None if record.get("pred_proba_struct") is None else np.asarray(record["pred_proba_struct"], dtype=np.float32)
+        seq_probs = None if record.get("pred_proba_seq") is None else np.asarray(record["pred_proba_seq"], dtype=np.float32)
         gate_probs = None if record.get("pred_gate") is None else np.asarray(record["pred_gate"], dtype=np.float32)
 
         for idx in range(len(probs)):
-            go_term = _resolve_go_term(go_terms_mapping, idx)
-            rows.append(
-                {
-                    "go_id": go_term,
-                    "pred_prob": float(probs[idx]),
-                    "struct_prob": float(struct_probs[idx]),
-                    "seq_prob": float(seq_probs[idx]),
-                    "gate": float(gate_probs[idx]) if gate_probs is not None else None,
-                }
-            )
+            row = {"go_id": _resolve_go_term(go_terms_mapping, idx), prob_col: float(probs[idx])}
+            if struct_probs is not None:
+                row["struct_prob"] = float(struct_probs[idx])
+            if seq_probs is not None:
+                row["seq_prob"] = float(seq_probs[idx])
+            if gate_probs is not None:
+                row["gate"] = float(gate_probs[idx])
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
-def build_propagated_prediction_table(protein_records, go_terms_mapping):
+def build_propagated_prediction_table(protein_records, go_terms_mapping, model_type="fusion"):
     """Per-GO-term table with hierarchically-propagated source terms and raw probabilities.
 
-    Columns: go_id, prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prob, struct_prob, seq_prob.
+    Fusion: go_id, prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prob, struct_prob, seq_prob.
+    Standalone structure/sequence: go_id, <branch>_prop_go_id, <branch>_prob.
     """
+    prob_col, prop_go_col, _ = _PRIMARY_COLS[model_type]
     rows = []
     for record in protein_records:
         probs = np.asarray(record["pred_proba"], dtype=np.float32)
-        struct_probs = np.asarray(record["pred_proba_struct"], dtype=np.float32)
-        seq_probs = np.asarray(record["pred_proba_seq"], dtype=np.float32)
         prop_source_idx = np.asarray(record["prop_source_idx"], dtype=np.int64)
-        struct_prop_source_idx = np.asarray(record["struct_prop_source_idx"], dtype=np.int64)
-        seq_prop_source_idx = np.asarray(record["seq_prop_source_idx"], dtype=np.int64)
+        struct_probs = None if record.get("pred_proba_struct") is None else np.asarray(record["pred_proba_struct"], dtype=np.float32)
+        seq_probs = None if record.get("pred_proba_seq") is None else np.asarray(record["pred_proba_seq"], dtype=np.float32)
+        struct_src = None if record.get("struct_prop_source_idx") is None else np.asarray(record["struct_prop_source_idx"], dtype=np.int64)
+        seq_src = None if record.get("seq_prop_source_idx") is None else np.asarray(record["seq_prop_source_idx"], dtype=np.int64)
 
         for idx in range(len(probs)):
-            go_term = _resolve_go_term(go_terms_mapping, idx)
-            rows.append(
-                {
-                    "go_id": go_term,
-                    "prop_go_id": _resolve_go_term(go_terms_mapping, prop_source_idx[idx]),
-                    "struct_prop_go_id": _resolve_go_term(go_terms_mapping, struct_prop_source_idx[idx]),
-                    "seq_prop_go_id": _resolve_go_term(go_terms_mapping, seq_prop_source_idx[idx]),
-                    "pred_prob": float(probs[idx]),
-                    "struct_prob": float(struct_probs[idx]),
-                    "seq_prob": float(seq_probs[idx]),
-                }
-            )
+            row = {"go_id": _resolve_go_term(go_terms_mapping, idx),
+                   prop_go_col: _resolve_go_term(go_terms_mapping, prop_source_idx[idx])}
+            if struct_src is not None:
+                row["struct_prop_go_id"] = _resolve_go_term(go_terms_mapping, struct_src[idx])
+            if seq_src is not None:
+                row["seq_prop_go_id"] = _resolve_go_term(go_terms_mapping, seq_src[idx])
+            row[prob_col] = float(probs[idx])
+            if struct_probs is not None:
+                row["struct_prob"] = float(struct_probs[idx])
+            if seq_probs is not None:
+                row["seq_prob"] = float(seq_probs[idx])
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -1101,43 +1142,50 @@ def _branch_mask(probs, t):
 
 
 def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, top_k=10,
-                             go_name_map=None, propagated_records=None):
-    """Thresholded / top-k prediction summary across branches (fusion, structure, sequence).
+                             go_name_map=None, propagated_records=None, model_type="fusion"):
+    """Thresholded / top-k prediction summary for the selected model.
 
-    ``threshold`` is either a single float (applied to all branches) or a ``(fusion_and_sequence,
-    structure)`` pair. For each protein, a GO term is kept when *any* branch probability passes
-    its threshold. A threshold of 0 keeps every term, and a threshold of 1 keeps none. Selected
-    terms are sorted by fusion probability, then sequence, then structure (all descending).
-    Reports raw probabilities per branch. When ``propagated_records`` is provided, the propagated
-    columns (prop_go_id, struct_prop_go_id, seq_prop_go_id, pred_prop_prob, struct_prop_prob,
-    seq_prop_prob) are added as well; when it is None those columns are omitted entirely. Returns
-    the summary DataFrame and ``{protein_id: [selected GO ids]}``.
+    ``threshold`` is either a single float or a ``(fusion_and_sequence, structure)`` pair; the
+    structure model uses the second value, sequence and fusion use the first. A GO term is kept
+    when the model's probability (for fusion: any of its fusion/structure/sequence branches)
+    passes the relevant threshold; 0 keeps every term, 1 keeps none. ``pred_prob`` is the selected
+    model's probability; for a fusion record the sub-branch columns (struct_prob, seq_prob, gate)
+    are added and selected terms are sorted by fusion, then sequence, then structure (all desc). A
+    standalone structure/sequence model reports only ``pred_prob`` and sorts by it. When
+    ``propagated_records`` is provided the matching propagated columns are appended. Returns the
+    summary DataFrame and ``{protein_id: [selected GO ids]}``.
     """
     rows = []
     goterms = {}
+    prob_col, prop_go_col, prop_prob_col = _PRIMARY_COLS[model_type]
+    t_fs, t_struct = (None, None) if threshold is None else _threshold_pair(threshold)
+    primary_threshold = t_struct if model_type == "structure" else t_fs
     propagated_lookup = {}
     if propagated_records is not None:
         propagated_lookup = {str(record["protein_id"]): record for record in propagated_records}
     for record in protein_records:
         probs = np.asarray(record["pred_proba"], dtype=np.float32)
-        struct_probs = np.asarray(record["pred_proba_struct"], dtype=np.float32)
-        seq_probs = np.asarray(record["pred_proba_seq"], dtype=np.float32)
+        struct_probs = None if record.get("pred_proba_struct") is None else np.asarray(record["pred_proba_struct"], dtype=np.float32)
+        seq_probs = None if record.get("pred_proba_seq") is None else np.asarray(record["pred_proba_seq"], dtype=np.float32)
         gate_probs = None if record.get("pred_gate") is None else np.asarray(record["pred_gate"], dtype=np.float32)
         propagated_record = propagated_lookup.get(str(record["protein_id"]))
         prop_probs = None if propagated_record is None else np.asarray(propagated_record["pred_proba"], dtype=np.float32)
-        struct_prop_probs = None if propagated_record is None else np.asarray(propagated_record["pred_proba_struct"], dtype=np.float32)
-        seq_prop_probs = None if propagated_record is None else np.asarray(propagated_record["pred_proba_seq"], dtype=np.float32)
-        prop_source_idx = None if propagated_record is None or propagated_record.get("prop_source_idx") is None else np.asarray(propagated_record["prop_source_idx"], dtype=np.int64)
-        struct_prop_source_idx = None if propagated_record is None or propagated_record.get("struct_prop_source_idx") is None else np.asarray(propagated_record["struct_prop_source_idx"], dtype=np.int64)
-        seq_prop_source_idx = None if propagated_record is None or propagated_record.get("seq_prop_source_idx") is None else np.asarray(propagated_record["seq_prop_source_idx"], dtype=np.int64)
+        prop_source_idx = None if propagated_record is None else np.asarray(propagated_record["prop_source_idx"], dtype=np.int64)
+        struct_prop_probs = None if propagated_record is None or struct_probs is None else np.asarray(propagated_record["pred_proba_struct"], dtype=np.float32)
+        seq_prop_probs = None if propagated_record is None or seq_probs is None else np.asarray(propagated_record["pred_proba_seq"], dtype=np.float32)
+        struct_prop_source_idx = None if propagated_record is None or struct_probs is None else np.asarray(propagated_record["struct_prop_source_idx"], dtype=np.int64)
+        seq_prop_source_idx = None if propagated_record is None or seq_probs is None else np.asarray(propagated_record["seq_prop_source_idx"], dtype=np.int64)
 
-        # Keep a term if any branch passes its threshold. Fusion and sequence share the first
-        # threshold; structure uses the second (see _threshold_pair).
+        # Keep a term if the model (any branch, for fusion) passes its threshold. Structure uses
+        # the structure threshold; sequence/fusion use the first threshold.
         if threshold is None:
             idxs = np.arange(len(probs), dtype=np.int64)
         else:
-            t_fs, t_struct = _threshold_pair(threshold)
-            mask = _branch_mask(probs, t_fs) | _branch_mask(seq_probs, t_fs) | _branch_mask(struct_probs, t_struct)
+            mask = _branch_mask(probs, primary_threshold)
+            if struct_probs is not None:
+                mask = mask | _branch_mask(struct_probs, t_struct)
+            if seq_probs is not None:
+                mask = mask | _branch_mask(seq_probs, t_fs)
             idxs = np.where(mask)[0]
 
         # Drop ontology root terms (molecular_function / cellular_component / biological_process):
@@ -1147,9 +1195,11 @@ def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, t
             dtype=np.int64,
         )
 
-        # Sort selected terms by fusion probability, then sequence, then structure (all desc).
+        # Sort by the primary probability, with structure/sequence as tiebreakers when present
+        # (fusion: fusion, then sequence, then structure, all descending).
         if idxs.size:
-            order = np.lexsort((struct_probs[idxs], seq_probs[idxs], probs[idxs]))[::-1]
+            sort_keys = [k[idxs] for k in (struct_probs, seq_probs) if k is not None] + [probs[idxs]]
+            order = np.lexsort(tuple(sort_keys))[::-1]
             idxs = idxs[order]
 
         if top_k is not None:
@@ -1157,30 +1207,32 @@ def build_prediction_summary(protein_records, go_terms_mapping, threshold=0.5, t
 
         goterms[record["protein_id"]] = [_resolve_go_term(go_terms_mapping, int(i)) for i in idxs]
         for rank, idx in enumerate(idxs, start=1):
-            go_term = _resolve_go_term(go_terms_mapping, int(idx))
+            idx = int(idx)
+            go_term = _resolve_go_term(go_terms_mapping, idx)
             row = {
                 "protein_id": record["protein_id"],
                 "rank": rank,
-                # "selection": selection,
                 "go_term": go_term,
                 "go_term_name": _resolve_go_name(go_term, go_name_map),
-                # "term_idx": int(idx),
-                "pred_prob": float(probs[int(idx)]),
-                "struct_prob": float(struct_probs[int(idx)]),
-                "seq_prob": float(seq_probs[int(idx)]),
-                "gate": float(gate_probs[int(idx)]) if gate_probs is not None else None,
+                prob_col: float(probs[idx]),
             }
+            if struct_probs is not None:
+                row["struct_prob"] = float(struct_probs[idx])
+            if seq_probs is not None:
+                row["seq_prob"] = float(seq_probs[idx])
+            if gate_probs is not None:
+                row["gate"] = float(gate_probs[idx])
             # Propagated columns are included only when propagation data is available.
             if propagated_record is not None:
-                row.update(
-                    {
-                        "prop_go_id": None if prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(prop_source_idx[int(idx)])),
-                        "struct_prop_go_id": None if struct_prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(struct_prop_source_idx[int(idx)])),
-                        "seq_prop_go_id": None if seq_prop_source_idx is None else _resolve_go_term(go_terms_mapping, int(seq_prop_source_idx[int(idx)])),
-                        "pred_prop_prob": None if prop_probs is None else float(prop_probs[int(idx)]),
-                        "struct_prop_prob": None if struct_prop_probs is None else float(struct_prop_probs[int(idx)]),
-                        "seq_prop_prob": None if seq_prop_probs is None else float(seq_prop_probs[int(idx)]),
-                    }
-                )
+                row[prop_go_col] = _resolve_go_term(go_terms_mapping, int(prop_source_idx[idx]))
+                if struct_prop_source_idx is not None:
+                    row["struct_prop_go_id"] = _resolve_go_term(go_terms_mapping, int(struct_prop_source_idx[idx]))
+                if seq_prop_source_idx is not None:
+                    row["seq_prop_go_id"] = _resolve_go_term(go_terms_mapping, int(seq_prop_source_idx[idx]))
+                row[prop_prob_col] = float(prop_probs[idx])
+                if struct_prop_probs is not None:
+                    row["struct_prop_prob"] = float(struct_prop_probs[idx])
+                if seq_prop_probs is not None:
+                    row["seq_prop_prob"] = float(seq_prop_probs[idx])
             rows.append(row)
     return pd.DataFrame(rows), goterms
