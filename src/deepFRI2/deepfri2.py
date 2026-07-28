@@ -5,18 +5,22 @@ Predict Gene Ontology (GO) terms for proteins with deepFRI2.
 
 Usage
 -----
-    python src/deepFRI2/deepfri2.py --input_dir /path/to/structures
+    python src/deepFRI2/deepfri2.py --input /path/to/structures
     python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt
+    python src/deepFRI2/deepfri2.py -i sequences.fasta -o results/run2   # sequence model
 
 Inputs
 ------
-    --input_dir  / -i : folder with protein structures (``.cif`` / ``.pdb``).       [required]
+    --input      / -i : either a folder with protein structures (``.cif`` / ``.pdb``) or a single
+                        FASTA file of sequences. A FASTA input runs the sequence model only:
+                        ``--model`` and ``--ids_file`` are ignored, and ``--threshold`` uses only
+                        its first value.                                              [required]
     --output_dir / -o : folder for results; defaults to ``<repo>/results`` if omitted.
     --ids_file   / -f : text file with one entry per line naming the structures to run;
                         each entry is an id, optionally with a ``.cif`` / ``.pdb`` extension
                         and/or a relative subfolder path (``abCD``, ``abCD.cif``, ``sub/abCD``,
-                        ``sub1/sub2/abCD.cif``); resolved under ``--input_dir``. If omitted,
-                        every top-level structure in ``--input_dir`` is processed.
+                        ``sub1/sub2/abCD.cif``); resolved under ``--input``. If omitted,
+                        every top-level structure in ``--input`` is processed. Ignored for FASTA input.
     --aspect     / -a : comma-separated GO aspects (ontologies) to run: any of MF, CC, BP
                         (case-insensitive). Default: mf,cc,bp.
     --model      / -m : which model to run: ``sequence`` (embeddings only), ``structure``
@@ -245,11 +249,15 @@ def validate_input_dir(input_dir, require_structures=True):
 # Inference
 # =========
 
-def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_model,
+def run_inference(input_path, output_dir, file_names, models, tokenizer, esm_model,
                   device, go_terms_mappings, descendant_indices_by_ontology, go_name_map,
                   batch_size, threshold, top_k, prop=False, aspects=None, summary_only=False,
-                  model="fusion"):
+                  model="fusion", from_fasta=False):
     """Run inference for the selected model (fusion/structure/sequence) and write outputs.
+
+    ``input_path`` is either a directory of structures or, when ``from_fasta`` is True, a single
+    FASTA file of sequences (in which case ``model`` is 'sequence' and inputs are ESM embeddings
+    only, no distograms).
 
     Produces, under ``output_dir``:
     - ``preds/<protein>__<ontology>.csv``            (per-term probabilities for the selected model;
@@ -271,6 +279,7 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
         inference_for_batch,
         log_timing,
         prepare_batches_for_inference,
+        prepare_batches_from_fasta,
         propagate_prediction_record,
     )
 
@@ -297,19 +306,31 @@ def run_inference(input_dir, output_dir, file_names, models, tokenizer, esm_mode
     inference_elapsed = 0.0  # model forward-pass time only (excludes parsing/embedding/IO)
     start = time.perf_counter()
 
-    batch_iterator = prepare_batches_for_inference(
-        input_dir,
-        tokenizer=tokenizer,
-        model=esm_model,
-        device=device,
-        atom_name=DIST_TYPE,
-        max_seq_len=MAX_SEQ_LEN,
-        emb_size=ESM_DIM,
-        sigma_dist=SIGMA_DIST,
-        batch_size=batch_size,
-        file_names=file_names,
-        model_type=model,
-    )
+    if from_fasta:
+        batch_iterator = prepare_batches_from_fasta(
+            input_path,
+            tokenizer=tokenizer,
+            model=esm_model,
+            device=device,
+            max_seq_len=MAX_SEQ_LEN,
+            emb_size=ESM_DIM,
+            sigma_dist=SIGMA_DIST,
+            batch_size=batch_size,
+        )
+    else:
+        batch_iterator = prepare_batches_for_inference(
+            input_path,
+            tokenizer=tokenizer,
+            model=esm_model,
+            device=device,
+            atom_name=DIST_TYPE,
+            max_seq_len=MAX_SEQ_LEN,
+            emb_size=ESM_DIM,
+            sigma_dist=SIGMA_DIST,
+            batch_size=batch_size,
+            file_names=file_names,
+            model_type=model,
+        )
 
     for batch_idx, batch in enumerate(batch_iterator, start=1):
         batch_ids, embeddings_batch, distograms_batch, masks_batch = batch
@@ -465,8 +486,10 @@ def parse_args(argv=None):
         description="deepFRI2 inference: predict GO terms for protein structures.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--input_dir", "-i", type=Path, required=True,
-                        help="Folder with protein structures (.cif / .pdb).")
+    parser.add_argument("--input", "-i", type=Path, required=True, dest="input",
+                        help="Either a folder with protein structures (.cif / .pdb) or a single "
+                             "FASTA file of sequences. A FASTA input runs the sequence model only "
+                             "(--model and --ids_file are ignored; --threshold uses its first value).")
     parser.add_argument("--output_dir", "-o", type=Path, default=None,
                         help="Folder for results (default: <repo>/results).")
     parser.add_argument("--ids_file", "-f", type=Path, default=None,
@@ -522,60 +545,79 @@ def main(argv=None):
         force=True,
     )
 
-    input_dir = args.input_dir
+    input_path = args.input
     output_dir = args.output_dir if args.output_dir is not None else REPO_ROOT / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_log_file(output_dir / "log.txt")
-    
+
+    # A directory input runs structures; a single file input is read as FASTA and runs the
+    # sequence model only (so --model and --ids_file don't apply).
+    if not input_path.exists():
+        _fatal(f"Input does not exist: {input_path}")
+    if input_path.is_file() and input_path.suffix.lower() in (".cif", ".pdb"):
+        _fatal(f"--input is a single structure file: {input_path}. Put structures in a directory "
+               f"(a single-file input is read as a FASTA of sequences).")
+    from_fasta = input_path.is_file()
+    model = "sequence" if from_fasta else args.model
+
     # Heavy dependencies are imported only now, after argument parsing, so `--help`
     # and argument errors return without paying the torch/transformers import cost.
     logger.info("Loading torch...")
     import torch
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Report the full run configuration up front for transparency.
-    ids_file = args.ids_file if args.ids_file is not None else "None (all structures in input dir)"
     top_k = args.top_k if args.top_k is not None else "all"
     threshold_fs, threshold_struct = args.threshold
     aspects = args.aspect
     logger.info(f"Model version   : {config_version()}")
-    logger.info(f"Input dir       : {input_dir}")
+    logger.info(f"Input           : {input_path} ({'FASTA sequences' if from_fasta else 'structure directory'})")
     logger.info(f"Output dir      : {output_dir}")
-    logger.info(f"IDs file        : {ids_file}")
-    logger.info(f"Aspects         : {', '.join(aspects)}")
-    logger.info(f"Model           : {args.model}")
-    logger.info(f"Batch size      : {args.batch_size}")
-    # Single models use a single threshold (structure -> the structure value, sequence -> the
-    # first value); only fusion uses the two-value pair (one per branch).
-    if args.model == "structure":
-        logger.info(f"Threshold       : struct={threshold_struct}")
-    elif args.model == "sequence":
+    if from_fasta:
+        if args.ids_file is not None:
+            logger.warning("--ids_file is ignored for FASTA input; all sequences are used.")
+        logger.info("Model           : sequence (FASTA input; --model not applicable)")
         logger.info(f"Threshold       : seq={threshold_fs}")
     else:
-        logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
+        ids_file = args.ids_file if args.ids_file is not None else "None (all structures in input dir)"
+        logger.info(f"IDs file        : {ids_file}")
+        logger.info(f"Model           : {model}")
+        # Single models use a single threshold (structure -> the structure value, sequence -> the
+        # first value); only fusion uses the two-value pair (one per branch).
+        if model == "structure":
+            logger.info(f"Threshold       : struct={threshold_struct}")
+        elif model == "sequence":
+            logger.info(f"Threshold       : seq={threshold_fs}")
+        else:
+            logger.info(f"Threshold       : fusion/seq={threshold_fs}, struct={threshold_struct}")
+    logger.info(f"Aspects         : {', '.join(aspects)}")
+    logger.info(f"Batch size      : {args.batch_size}")
     logger.info(f"Top k           : {top_k}")
     logger.info(f"Propagate       : {args.prop}")
     logger.info(f"Summary only    : {args.summary}")
     logger.info(f"Verbose         : {args.verbose}")
     logger.info(f"Device          : {device}")
 
-    # Validate inputs before any heavy work: on fatal problems (missing/empty input dir
-    # or ids file, or no matching ids) this logs an ERROR and terminates without running.
-    validate_input_dir(input_dir, require_structures=args.ids_file is None)
-    file_names = resolve_file_names(input_dir, args.ids_file)
+    # Validate inputs before any heavy work. For a structure directory this can terminate on
+    # missing/empty dir or ids; for FASTA the reader itself warns about empty/duplicate entries.
+    if from_fasta:
+        file_names = None
+    else:
+        validate_input_dir(input_path, require_structures=args.ids_file is None)
+        file_names = resolve_file_names(input_path, args.ids_file)
 
     go_terms_mappings = load_go_terms_mappings(PARAMS_DIR)
     num_labels_by_ontology = {ont: len(m) for ont, m in go_terms_mappings.items()}
 
     # ESM embeddings are only needed by the sequence and fusion models; the structure model
     # reads only distograms, so skip loading ESM entirely for it.
-    if args.model in ("sequence", "fusion"):
+    if model in ("sequence", "fusion"):
         tokenizer, esm_model = load_esm(device, PARAMS_DIR)
     else:
         tokenizer, esm_model = None, None
-    # Build only the requested aspect models (--aspect), for the selected model type (--model).
-    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects, model_type=args.model)
+    # Build only the requested aspect models (--aspect), for the selected model type.
+    models = load_models(device, num_labels_by_ontology, PARAMS_DIR, ontologies=aspects, model_type=model)
 
     go_graph, go_name_map = load_go_name_map(PARAMS_DIR / f"go_{GO_VERSION}.obo")
     # GO-hierarchy descendant indices are only needed for propagation (--prop), and only
@@ -590,10 +632,11 @@ def main(argv=None):
     )
 
     run_inference(
-        input_dir, output_dir, file_names, models, tokenizer, esm_model, device,
+        input_path, output_dir, file_names, models, tokenizer, esm_model, device,
         go_terms_mappings, descendant_indices_by_ontology, go_name_map,
         batch_size=args.batch_size, threshold=args.threshold, top_k=args.top_k,
-        prop=args.prop, aspects=aspects, summary_only=args.summary, model=args.model,
+        prop=args.prop, aspects=aspects, summary_only=args.summary, model=model,
+        from_fasta=from_fasta,
     )
     logger.info("Done.")
 

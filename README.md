@@ -47,14 +47,20 @@ python src/deepFRI2/download_esm.py
 Predict GO terms for a folder of protein structures (`.cif` / `.pdb`):
 
 ```bash
-python src/deepFRI2/deepfri2.py --input_dir path/to/structures
+python src/deepFRI2/deepfri2.py --input path/to/structures
+```
+
+Or run the sequence model on a FASTA file of sequences (no structures needed):
+
+```bash
+python src/deepFRI2/deepfri2.py --input sequences.fasta
 ```
 
 Options (run `python src/deepFRI2/deepfri2.py --help` for the full list):
 
 | Flag | Description |
 | --- | --- |
-| `-i`, `--input_dir` | Folder with `.cif` / `.pdb` structures. **(required)** |
+| `-i`, `--input` | Either a folder with `.cif` / `.pdb` structures **or** a single FASTA file of sequences. A FASTA input runs the sequence model only: `--model` and `--ids_file` are ignored, and `--threshold` uses only its first value. **(required)** |
 | `-o`, `--output_dir` | Folder for results (default: `<repo>/results`). |
 | `-f`, `--ids_file` | Text file listing structures to run, one per line. Each entry is an id, optionally with a `.cif` / `.pdb` extension and/or a relative subfolder path (`abCD`, `abCD.cif`, `sub/abCD`, `sub1/sub2/abCD.cif`), resolved under the input folder. An id without an extension resolves to `.cif` if present, else `.pdb`. Default: all *top-level* files in the input folder. |
 | `-a`, `--aspect` | Comma-separated GO aspects (ontologies) to run: any of `MF`, `CC`, `BP` (case-insensitive). Default: `mf,cc,bp`. |

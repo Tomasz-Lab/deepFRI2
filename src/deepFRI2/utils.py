@@ -691,6 +691,84 @@ def preprocess_data(embedding, distogram, max_seq_len, emb_size, sigma_dist) -> 
     return padded_embedding, distogram_processed, mask
 
 
+def read_fasta(path):
+    """Parse a FASTA file into a list of ``(id, sequence)``.
+
+    The id is the first whitespace-delimited token of the header (after ``>``); sequences may span
+    multiple lines. Blank lines are ignored. Order is preserved.
+    """
+    entries, cur_id, cur_seq = [], None, []
+    with open(path) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if cur_id is not None:
+                    entries.append((cur_id, "".join(cur_seq)))
+                header = line[1:].strip()
+                cur_id = header.split()[0] if header else ""
+                cur_seq = []
+            else:
+                cur_seq.append(line)
+    if cur_id is not None:
+        entries.append((cur_id, "".join(cur_seq)))
+    return entries
+
+
+def prepare_batches_from_fasta(fasta_path, tokenizer, model, device, max_seq_len, emb_size,
+                               sigma_dist=0.0, batch_size=32):
+    """Read a FASTA file and yield sequence-model batches (embeddings only; no distograms).
+
+    Yields ``(batch_ids, embeddings, distograms, masks)`` like ``prepare_batches_for_inference``,
+    but the distograms are zero placeholders (the sequence model ignores them). IDs are the FASTA
+    headers' first token; entries with an empty sequence or a duplicate id are dropped with a
+    warning. ``sigma_dist`` is unused (kept for signature symmetry; no distogram is transformed).
+    """
+    logger.info("Preparing inputs for inference (FASTA sequences)...")
+    seen, cleaned, dup, empty = set(), [], 0, 0
+    for pid, seq in read_fasta(fasta_path):
+        if not seq:
+            empty += 1
+        elif pid in seen:
+            dup += 1
+        else:
+            seen.add(pid)
+            cleaned.append((pid, seq))
+    if empty:
+        logger.warning(f"Skipped {empty} FASTA entr(y/ies) with an empty sequence.")
+    if dup:
+        logger.warning(f"Skipped {dup} FASTA entr(y/ies) with a duplicate id.")
+
+    total = 0
+    embedding_elapsed = 0.0
+    for chunk_idx, chunk_start in enumerate(range(0, len(cleaned), batch_size), start=1):
+        chunk = cleaned[chunk_start: chunk_start + batch_size]
+        batch_ids = [pid for pid, _ in chunk]
+        sequences = [seq for _, seq in chunk]
+
+        embedding_start = time.perf_counter()
+        embeddings = generate_embeddings_for_list(sequences, tokenizer, model, device,
+                                                  show_progress=False, log_start=False)
+        embedding_batch_elapsed = time.perf_counter() - embedding_start
+        embedding_elapsed += embedding_batch_elapsed
+        log_timing(f"Embeddings batch {chunk_idx:>3}", embedding_batch_elapsed, len(chunk), "protein")
+
+        batch_embeddings, batch_distograms, batch_masks = [], [], []
+        for embedding in embeddings:
+            emb, dist, mask = preprocess_data(embedding, None, max_seq_len, emb_size, sigma_dist)
+            batch_embeddings.append(emb)
+            batch_distograms.append(dist)
+            batch_masks.append(mask)
+        total += len(chunk)
+        yield (batch_ids, torch.stack(batch_embeddings), torch.stack(batch_distograms),
+               torch.stack(batch_masks))
+
+    if not cleaned:
+        logger.warning(f"No usable sequences found in FASTA file {fasta_path}")
+    log_timing("Embeddings generation", embedding_elapsed, total, "protein")
+
+
 def prepare_batches_for_inference(
     struct_path,
     tokenizer,
