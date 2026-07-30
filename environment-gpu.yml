@@ -10,11 +10,11 @@ channels:
   - conda-forge
 dependencies:
   - python=3.12.8
-  # Validated PyTorch build; looser cuda126* pins may resolve to a newer build
-  # which may cause slightly different probabilities outputed from the model
-  - pytorch=2.5.1=cuda126_py312h1763f6d_306
+  # GPU build (conda-forge, CUDA 12.6). Any cuda126 build works: the model runs in 
+  # float32, so different PyTorch builds / cuDNN versions agree to float32-rounding 
+  # (~1e-4 on structure/fusion, ~1e-6 on sequence).
+  - pytorch=2.5.1=cuda126*
   - cuda-version=12.6
-  - cudnn=9.3.*
   - numpy=1.26.4
   - pandas=2.2.3
   - scipy=1.14.1

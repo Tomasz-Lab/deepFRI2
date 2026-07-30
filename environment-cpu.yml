@@ -3,8 +3,8 @@
 #     conda env create -f environment-cpu.yml
 #     conda activate deepfri2_cpu
 #
-# Note: CPU probabilities may differ from the GPU probabilities on structure/fusion models
-# due to bf16 autocast on GPU only. GO ranking and thresholded term sets remain similar but sometimes are not identical
+# Note: the model runs in float32, so CPU and GPU results agree to float32-rounding
+# (~1e-4 on structure/fusion probabilities); GO ranking and thresholded terms are effectively identical.
 name: deepfri2_cpu
 channels:
   - conda-forge

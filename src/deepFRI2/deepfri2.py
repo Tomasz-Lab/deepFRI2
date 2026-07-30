@@ -301,6 +301,7 @@ def run_inference(input_path, output_dir, file_names, models, tokenizer, esm_mod
     # rows are ordered protein-major (proteins in batch order, aspects MF -> CC -> BP); batches are
     # processed in order, so the file ends up protein-major overall.
     import pandas as pd
+    import torch
     summary_path.unlink(missing_ok=True)
     header_written = False
 
@@ -334,11 +335,29 @@ def run_inference(input_path, output_dir, file_names, models, tokenizer, esm_mod
             model_type=model,
         )
 
+    # One-time CUDA/cuDNN warmup so the first real batch's inference timing isn't inflated by lazy
+    # kernel init / handle creation (this fixed startup cost is charged here, not to the first
+    # ontology). Runs each aspect model once on a tiny dummy input; results are discarded.
+    if device.type == "cuda":
+        warmup_start = time.perf_counter()
+        warm = (torch.zeros(1, MAX_SEQ_LEN, ESM_DIM, device=device),
+                torch.zeros(1, MAX_SEQ_LEN, MAX_SEQ_LEN, device=device),
+                torch.ones(1, MAX_SEQ_LEN, device=device))
+        with torch.no_grad():
+            for ontology in aspects:
+                models[ontology](*warm, return_branches=True) if model == "fusion" else models[ontology](*warm)
+        torch.cuda.synchronize()
+        log_timing("CUDA warmup", time.perf_counter() - warmup_start, len(aspects), "model")
+
     for batch_idx, batch in enumerate(batch_iterator, start=1):
         batch_ids, embeddings_batch, distograms_batch, masks_batch = batch
         embeddings_batch = embeddings_batch.to(device)
         distograms_batch = distograms_batch.to(device)
         masks_batch = masks_batch.to(device)
+        # Realize the async host->device copy here so it counts as transfer time, not inside the
+        # first ontology's inference timer.
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         total_proteins += len(batch_ids)
 
         batch_summaries = []
