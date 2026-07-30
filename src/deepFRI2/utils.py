@@ -727,7 +727,6 @@ def prepare_batches_from_fasta(fasta_path, tokenizer, model, device, max_seq_len
     headers' first token; entries with an empty sequence or a duplicate id are dropped with a
     warning. ``sigma_dist`` is unused (kept for signature symmetry; no distogram is transformed).
     """
-    logger.info("Preparing inputs for inference (FASTA sequences)...")
     seen, cleaned, dup, empty = set(), [], 0, 0
     for pid, seq in read_fasta(fasta_path):
         if not seq:
@@ -805,7 +804,6 @@ def prepare_batches_for_inference(
     Yields:
         ``(batch_ids, embeddings, distograms, masks)`` tuples (plus struct info if requested).
     """
-    logger.info("Preparing inputs for inference...")
 
     struct_path = Path(struct_path)
 
