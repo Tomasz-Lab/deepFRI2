@@ -354,6 +354,7 @@ class StructuralProber(nn.Module):
         use_coverage_weighting: bool = False,
         hidden_dim_in: int = 512,
         hidden_dim_out: int = 512,
+        bn1_clamp: float = 10,
     ):
         super().__init__()
         self.num_labels = num_labels
@@ -379,10 +380,11 @@ class StructuralProber(nn.Module):
         self.enforce_pos_diag = enforce_positivity_diag
         self.enforce_pos_anti = enforce_positivity_anti
         self.reparam_zero_diag_for_diag_kernels = reparam_zero_diag_for_diag_kernels
+        self.bn1_clamp = bn1_clamp
         self.hidden_dim_in = hidden_dim_in
         self.hidden_dim_out = hidden_dim_out
         self.relu = nn.ReLU()
-
+        
         m_d = self.canonical_diag_ms
         m_a = self.canonical_anti_ms
 
@@ -447,6 +449,7 @@ class StructuralProber(nn.Module):
         self.fc1 = nn.Linear(in_dim, self.hidden_dim_in)
         self.bn1 = nn.BatchNorm1d(in_dim)
         self.out = nn.Linear(self.hidden_dim_out, self.num_labels)
+        self.bn1_clamp = 10.0  
 
         self.ARCHITECTURE = {
             "name": "Dual kernel conv2d: diagonal band + upper triangle (grouped conv, mask-aware)",
@@ -838,6 +841,8 @@ class StructuralProber(nn.Module):
 
         # MLP head.
         pooled = self.bn1(feat_mat)
+        if self.bn1_clamp is not None:
+            pooled = pooled.clamp(-self.bn1_clamp, self.bn1_clamp)
         hidden = self.fc1(pooled)
         hidden = self.relu(hidden)  # (batch_size, hidden_dim)
         logits = self.out(hidden)   # (batch_size, num_labels)
@@ -1231,7 +1236,7 @@ def build_deepfri2_model(
             peak_thresh=peak_thresh,
             topk_k=topk_k,
             frozen_kernels=False,
-            amp_dtype=torch.bfloat16,
+            amp_dtype=None,
             enforce_symmetry_diag=True,
             enforce_symmetry_anti=False,
             enforce_positivity_diag=False,
