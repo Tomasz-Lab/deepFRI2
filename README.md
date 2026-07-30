@@ -2,7 +2,6 @@
 
 [![GitHub](https://img.shields.io/badge/source-GitHub-303030.svg?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg?style=flat-square&logo=python)](https://www.python.org/)
-[![embeddings](https://img.shields.io/badge/embeddings-ESM-4caf50?style=flat-square)](https://github.com/facebookresearch/esm)
 [![License](https://img.shields.io/github/license/Tomasz-Lab/deepFRI2?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2/blob/main/LICENSE)
 [![Issues](https://img.shields.io/github/issues/Tomasz-Lab/deepFRI2?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2/issues)
 
@@ -90,7 +89,7 @@ python src/deepFRI2/deepfri2.py -i structures/ -o results/run1 -f ids.txt -t 0.3
 
 - GPU environment is the default and recommended one.
 - The model runs in float32 on both CPU and GPU, so CPU and GPU results agree closely — differences are at the float32-rounding level (~1e-4 on structure/fusion probabilities, ~1e-6 on sequence), driven only by the BLAS/cuDNN kernels. GO ranking and thresholded term sets are effectively identical.
-- In the current setup, the model processes up to 1020 aa (longer proteins are truncated). There is no lower limit; however, the structural prober is not sensitive to proteins shorter than 60 aa (in which case predictions equal the mean across the training data).
+- In the current setup, the model processes up to 1,020 aa. Longer proteins are truncated during inference (no functional signal beyond 1,020 aa), but ESM embeddings are generated for the full protein, which may be time-consuming. Therefore, it is recommended to run the model on functionally relevant domains. There is no lower limit; however, the structural prober is not sensitive to proteins shorter than 60 aa (in which case predictions equal the mean across the training data).
 - The current version was trained on gapless structures, so **fully resolved inputs (no missing residues) are recommended**. For structures with gaps, a missing residue zeroes out its whole row/column in the residue–residue similarity map, breaking the backbone-adjacency band and pushing the structure model out of distribution. As a rough safeguard we fill only the immediate `-1/+1` off-diagonals at gap positions with `1` (a non-zero, "these consecutive residues are neighbours" signal). 
   
 ## Output
@@ -106,21 +105,20 @@ For a quick overview of predicted functions, please take a look at the `pred_pro
 
 ## Runtime
 
-End-to-end runtime (excluding model loading at startup, which usually takes 6–8 s per run) depends primarily on the available compute resources and the protein length. Initial benchmarks with the default settings (batch size: 32) yielded the following throughput:
+End-to-end runtime (excluding model loading at startup, which usually takes a couple of seconds per run) depends primarily on the available compute resources and the protein length. Initial benchmarks with the default settings (batch size: 32) yielded the following throughput:
 
-- 0.3–0.5 s/protein — GPU (NVIDIA A100)
-- 0.9–1.6 s/protein — CPU (48-core server)
+- 0.2–0.4 s/protein — GPU (NVIDIA A100)
+- 0.7–1.5 s/protein — CPU (48-core server)
 
 These measurements were obtained on protein datasets with median sequence lengths of 150–440 amino acids. Additional benchmarking is underway, and the results will be shared in future updates.
 
 For large-scale inference, we recommend a GPU or a multi-core CPU cluster. On CPU, ESM embeddings are computed one sequence at a time, each forward using all available core.
 
-Running the model on a personal computer (e.g., a laptop) is also possible. Initial tests on an Apple M3 Pro (11 CPU cores, 18 GB RAM) with a small set of proteins (median length ~150 aa; batch size: 32) took ~1.9 s/protein for embedding generation and ~36 s/protein for model inference — the structure model is markedly slower here because Apple-Silicon PyTorch ships a generic (non-MKL) CPU build. Local CPU inference is therefore best suited to small runs: select a subset with `--ids_file`, and if memory is tight lower `--batch_size` (each structure is padded to a fixed size, so smaller batches reduce peak memory rather than change per-core parallelism).
+Running the model on a personal computer (e.g., a laptop) is also possible. Initial tests on an Apple M3 Pro (11 CPU cores, 18 GB RAM) with a small set of proteins (median length ~150 aa; batch size: 32) took ~1.8 s/protein for embedding generation and ~32 s/protein for model inference — the structure model is markedly slower here because Apple-Silicon PyTorch ships a generic (non-MKL) CPU build. Local CPU inference is therefore best suited to small runs (e.g., select a subset of .cif/.pdb files with `--ids_file`) or with sequence-only mode (in such case, inference time drastically decreases to 2 s/protein).
 
 ## Future releases
 
 The model is still under development. We will soon add (among other things): 
-- sequence-only mode 
 - interpretability module
 - architectural details
 - detailed benchmarks
