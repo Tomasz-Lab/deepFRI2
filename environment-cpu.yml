@@ -18,6 +18,7 @@ dependencies:
   - safetensors=0.5.2
   - biopython=1.85
   - tqdm=4.67.1
+  - matplotlib-base=3.9.2
   - pip
   - pip:
       - fastobo==0.12.3

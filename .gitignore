@@ -18,6 +18,9 @@ params/esm2_t33_650M_UR50D/
 # Inference outputs
 results/
 
+# Test outputs
+tests/output/
+
 # OS / editor
 .DS_Store
 *.swp
