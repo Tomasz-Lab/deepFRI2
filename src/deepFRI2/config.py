@@ -11,19 +11,19 @@ device selection, ...). Those belong in the caller / CLI, not here.
 
 MODEL_NAMES = {
     'MF': {
-        'sequence': 'efficient-capybara-656',
-        'structure': 'bumbling-energy-750',
-        'fusion': 'robust-bird-751',
+        'sequence': 'fast-dream-733',
+        'structure': 'eager-wind-756',
+        'fusion': 'expert-surf-758',
     },
     'CC': {
-        'sequence': 'warm-dawn-692',
-        'structure': 'devoted-fog-754',
-        'fusion': 'fast-forest-755',
+        'sequence': 'denim-firefly-739',
+        'structure': 'stellar-elevator-757',
+        'fusion': 'cerulean-frost-762',
     },
     'BP': {
-        'sequence': 'morning-glade-695',
-        'structure': 'laced-grass-752',
-        'fusion': 'legendary-snow-753',
+        'sequence': 'major-dream-736',
+        'structure': 'trim-serenity-759',
+        'fusion': 'expert-valley-761',
     }
 }
 

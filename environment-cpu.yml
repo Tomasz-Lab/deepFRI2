@@ -3,8 +3,10 @@
 #     conda env create -f environment-cpu.yml
 #     conda activate deepfri2_cpu
 #
-# Note: the model runs in float32, so CPU and GPU results agree to float32-rounding
-# (~1e-4 on structure/fusion probabilities); GO ranking and thresholded terms are effectively identical.
+# Note: CPU and GPU results agree closely; probabilities differ by ~1e-3..1e-4 on structure,
+# ~1e-4 on fusion, ~1e-6 on sequence (GO ranking unaffected). Main cause: on the GPU cuDNN runs
+# the convolutions in TF32 by default while the CPU uses true float32 -- see README for details.
+# GO ranking and thresholded terms are effectively identical.
 name: deepfri2_cpu
 channels:
   - conda-forge
