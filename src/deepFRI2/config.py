@@ -11,19 +11,19 @@ device selection, ...). Those belong in the caller / CLI, not here.
 
 MODEL_NAMES = {
     'MF': {
-        'sequence': 'fast-dream-733',
-        'structure': 'eager-wind-756',
-        'fusion': 'expert-surf-758',
+        'sequence': 'comfy-silence-824',
+        'structure': 'good-glitter-814',
+        'fusion': 'dainty-deluge-829',
     },
     'CC': {
-        'sequence': 'denim-firefly-739',
-        'structure': 'stellar-elevator-757',
-        'fusion': 'cerulean-frost-762',
+        'sequence': 'valiant-waterfall-833',
+        'structure': 'daily-firefly-834',
+        'fusion': 'divine-donkey-835',
     },
     'BP': {
-        'sequence': 'major-dream-736',
-        'structure': 'trim-serenity-759',
-        'fusion': 'expert-valley-761',
+        'sequence': 'autumn-shape-836',
+        'structure': 'comic-cloud-837',
+        'fusion': 'leafy-silence-838',
     }
 }
 
@@ -44,6 +44,9 @@ M_ANTI = 60
 NUM_DIAG = 30
 NUM_ANTI = 30
 
-# GO ontology version (selects params/go_<GO_VERSION>.obo for hierarchy propagation)
+# TF32 backend flag for the structural prober's convolutions which keeps 
+# convolution outputs reproducible across GPUs / cuDNN versions and against CPU.
+CUDNN_ALLOW_TF32 = False
 
+# GO ontology version (selects params/go_<GO_VERSION>.obo for hierarchy propagation)
 GO_VERSION = '20250722'

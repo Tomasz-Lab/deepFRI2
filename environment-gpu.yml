@@ -10,10 +10,6 @@ channels:
   - conda-forge
 dependencies:
   - python=3.12.8
-  # GPU build (conda-forge, CUDA 12.6). Any cuda126 build works: the model runs in float32.
-  # Across cuDNN versions probabilities agree to ~1e-4 on structure, ~1e-5 on fusion, and are
-  # bit-identical on sequence. (cuDNN runs the convolutions in TF32 by default, so the structure
-  # branch differs more than the true-fp32 sequence/matmul path -- see README.)
   - pytorch=2.5.1=cuda126*
   - cuda-version=12.6
   - numpy=1.26.4

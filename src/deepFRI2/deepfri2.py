@@ -65,6 +65,7 @@ from logging import DEBUG, INFO, basicConfig, getLogger
 from pathlib import Path
 
 from config import (
+    CUDNN_ALLOW_TF32,
     DIST_TYPE,
     EMBED_MODEL_NAME,
     ESM_DIM,
@@ -589,6 +590,10 @@ def main(argv=None):
     # and argument errors return without paying the torch/transformers import cost.
     logger.info("Loading torch...")
     import torch
+
+    # cuDNN TF32 (config-driven): off = true float32 convolutions, reproducible across GPUs/cuDNN
+    # and vs CPU; on = the torch default, ~1e-4 non-determinism in the structure model.
+    torch.backends.cudnn.allow_tf32 = CUDNN_ALLOW_TF32
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
