@@ -1196,6 +1196,419 @@ def analyze_go_term(
             kernel_model.amp_dtype = original_kernel_amp
 
 
+# ------------------------------------------------------------------------------------------------
+# Per-GO-term calibration
+#
+# A report says "this protein scores 0.42 for GO:0004252". On its own that number means nothing:
+# the model's overall CAFA score is an ontology-wide average, and the threshold at which a term
+# is actually worth believing varies enormously between terms -- one carried by 40% of the
+# training proteins and one carried by 0.5% peak at completely different places.
+#
+# So deepFRI2-trainer sweeps the decision threshold per GO term, per sub-model and per split and
+# ships the resulting precision / recall curves as `params/<ontology>/calibration_<fusion run>.json`
+# next to the checkpoints. The report draws that curve behind the protein's own score. Without the
+# file everything still works -- the calibration row is simply not drawn.
+# ------------------------------------------------------------------------------------------------
+
+#: Sub-model -> the key of its probability in an analysis dict. The reports are always produced by
+#: the fusion model, and it holds its two branches frozen, so `esm_prob` / `struct_prob` are the
+#: stand-alone sub-models' outputs and are comparable with their own calibration curves.
+CALIBRATION_MODELS = (
+    ("fusion", "Fusion", "pred_prob"),
+    ("sequence", "Sequence", "esm_prob"),
+    ("structure", "Structure", "struct_prob"),
+)
+
+#: Split -> line style. `eval` is the homology-separated held-out split (thousands of proteins);
+#: `test` is the much smaller experimental-structure set, so its curves are noisier by construction.
+CALIBRATION_SPLIT_STYLES = {"eval": "-", "test": "--"}
+
+CALIBRATION_CURVE_COLORS = {"f1": "#305f72", "precision": "#0f766e", "recall": "#b45309"}
+
+#: Predictions a point of the curve needs before it is drawn as a measurement rather than faded.
+#: Precision over 300 predictions is a rate; precision over 2 is which two proteins happened to be
+#: in the split. The counts are stored per threshold (`n_pred`), so this cut-off lives here and can
+#: be changed without recalibrating anything.
+CALIBRATION_MIN_PREDICTIONS = 20
+
+#: Opacity of the faded stretch below that count, relative to the solid one.
+CALIBRATION_THIN_ALPHA = 0.35
+
+#: How this protein's own score is drawn. Red so it reads as "you are here" against the muted
+#: curve palette, and dash-dotted rather than dashed because dashed already means the test split
+#: two entries above it in the key. One definition, used by both the plot and the legend.
+CALIBRATION_SCORE_LINE = {"color": "#dc2626", "lw": 1.6, "ls": (0, (5, 1.6, 1, 1.6))}
+CALIBRATION_MODEL_COLORS = {"fusion": "#6247aa", "sequence": "#00a896", "structure": "#f4733e"}
+
+#: Height in inches of the calibration row added on top of the residue tracks.
+CALIBRATION_ROW_HEIGHT = 4.0
+
+#: Inches of the key column reserved for the legend, the rest going to the note below it. Held in
+#: inches rather than as a share of the row so that changing the row height moves the note with the
+#: legend instead of opening a gap between them.
+CALIBRATION_KEY_LEGEND_INCHES = 1.9
+
+
+class Calibration:
+    """Per-GO-term precision / recall curves, one JSON per ontology.
+
+    Loaded once per run and queried by GO id -- ids are unique across ontologies, so a term
+    requested via ``--go_terms`` from an aspect other than the primary one still finds its curves
+    as long as that aspect's file was loaded.
+    """
+
+    def __init__(self, by_ontology: dict[str, dict]):
+        self._by_ontology = by_ontology
+        self._ontology_of_term: dict[str, str] = {}
+        for ontology, payload in by_ontology.items():
+            for go_term in payload.get("terms", {}):
+                self._ontology_of_term.setdefault(str(go_term), ontology)
+
+    def __len__(self) -> int:
+        """Ontologies loaded -- so an instance built from no files at all is falsy."""
+        return len(self._by_ontology)
+
+    @classmethod
+    def load(cls, params_dir, model_names: dict[str, dict[str, str]],
+             ontologies=None) -> "Calibration":
+        """Read ``params/<ontology>/calibration_<fusion run>.json`` for each requested ontology.
+
+        A missing file is not an error: calibration is an optional extra the developer copies in
+        alongside the checkpoints, and a report without it is still a complete report.
+        """
+        params_dir = Path(params_dir)
+        loaded: dict[str, dict] = {}
+        for ontology in (ontologies or model_names.keys()):
+            fusion_run = (model_names.get(ontology) or {}).get("fusion")
+            if not fusion_run:
+                continue
+            path = params_dir / ontology / f"calibration_{fusion_run}.json"
+            if not path.is_file():
+                LOGGER.info("Calibration | %s | no %s - reports will omit the calibration row",
+                            ontology, path.name)
+                continue
+            with open(path) as handle:
+                payload = json.load(handle)
+            loaded[ontology] = payload
+            LOGGER.info("Calibration | %s | %s: %d terms, splits %s",
+                        ontology, path.name, int(payload.get("n_terms", 0)),
+                        sorted(payload.get("splits", {})))
+        return cls(loaded)
+
+    def for_term(self, go_term: str) -> dict[str, Any] | None:
+        """Everything ``_draw_term_calibration`` needs for one GO term, or ``None`` if unknown."""
+        ontology = self._ontology_of_term.get(str(go_term))
+        if ontology is None:
+            return None
+        payload = self._by_ontology[ontology]
+        return {
+            "ontology": ontology,
+            "runs": payload.get("runs", {}),
+            "thresholds": np.asarray(payload["thresholds"], dtype=np.float64),
+            "splits": payload.get("splits", {}),
+            "term": payload["terms"][str(go_term)],
+        }
+
+
+def _calibration_curves(curves: dict[str, Any]):
+    """Precision / recall / F1 / prediction-count arrays of one stored curve.
+
+    ``null`` precision becomes NaN: it is null above the highest score the model ever produced for
+    this term, so the precision and F1 lines simply stop there (matplotlib skips NaN) instead of
+    diving to zero. ``n_pred`` is absent from files written before it was recorded; those get an
+    all-``-1`` count, which reads as "unknown" everywhere and suppresses the thin-curve styling.
+    """
+    precision = np.array([np.nan if v is None else v for v in curves["precision"]], dtype=np.float64)
+    recall = np.asarray(curves["recall"], dtype=np.float64)
+    stored = curves.get("n_pred")
+    n_pred = (np.asarray(stored, dtype=np.int64) if stored is not None
+              else np.full(precision.shape, -1, dtype=np.int64))
+    total = precision + recall
+    with np.errstate(invalid="ignore"):
+        f1 = np.where(total > 0, 2 * precision * recall / np.where(total > 0, total, 1.0), 0.0)
+    return precision, recall, np.where(np.isnan(precision), np.nan, f1), n_pred
+
+
+def _reliable_upto(n_pred: np.ndarray) -> int | None:
+    """Index of the last threshold backed by at least ``CALIBRATION_MIN_PREDICTIONS`` predictions.
+
+    ``None`` when the count is unknown (an older file) or the curve is thin from the very start --
+    a term the model barely ever fires on has no trustworthy stretch at all, and saying so is the
+    point. The count only falls as the threshold rises, so the thin part is always a suffix.
+    """
+    if n_pred.size == 0 or n_pred[0] < 0:
+        return None
+    solid = np.flatnonzero(n_pred >= CALIBRATION_MIN_PREDICTIONS)
+    return int(solid[-1]) if solid.size else None
+
+
+def _calibrated_range_top(thresholds: np.ndarray, precision: np.ndarray) -> int | None:
+    """Index of the highest grid threshold at which the model still predicted something.
+
+    The count of predictions can only fall as the threshold rises, so the unmeasured points are
+    always a suffix of the grid -- there is never a hole in the middle to step over.
+    """
+    measured = np.flatnonzero(~np.isnan(precision))
+    return int(measured[-1]) if measured.size else None
+
+
+def _calibration_at(thresholds: np.ndarray, curves: dict[str, Any],
+                    probability: float) -> dict[str, Any]:
+    """What this score buys for this term: precision, recall, F1, and how solid the answer is.
+
+    The grid is coarse (0.05) so that a 4000-term ontology stays a file a developer can copy by
+    hand. F1 is derived from the interpolated precision and recall rather than interpolated
+    itself: F1 is not linear in the threshold, and ``2PR/(P+R)`` of the two interpolants is both
+    the smaller thing to store and the closer one to the truth.
+
+    Above the model's ceiling for the term, precision is **carried forward** from the last
+    threshold that had predictions, and ``range_top`` says which one that was. Neither of the two
+    obvious alternatives is acceptable there: interpolating towards a stored 0 invents a collapse
+    (a protein at 0.92 on a term whose top measured point is 0.90/P=0.81 would be told 0.39), and
+    refusing to answer throws away the fact that precision almost always *rises* with the
+    threshold, which makes the last measured value a fair lower bound. The caller marks it as
+    carried rather than passing it off as measured.
+    """
+    precision, recall, _, n_pred = _calibration_curves(curves)
+    at_recall = float(np.interp(probability, thresholds, recall))
+    # How many proteins of the split sit at or above this score. Interpolated between grid points,
+    # so it is an estimate -- but the question it answers ("is this rate built on 300 proteins or
+    # on 2?") only needs the order of magnitude.
+    at_n_pred = (None if n_pred[0] < 0
+                 else int(round(float(np.interp(probability, thresholds, n_pred.astype(float))))))
+    top = _calibrated_range_top(thresholds, precision)
+    if top is None:
+        return {"precision": None, "recall": at_recall, "f1": None, "range_top": None,
+                "n_pred": at_n_pred, "thin": True}
+
+    above = probability > thresholds[top]
+    at_precision = float(precision[top] if above else np.interp(probability, thresholds, precision))
+    total = at_precision + at_recall
+    return {
+        "precision": at_precision,
+        "recall": at_recall,
+        "f1": 2.0 * at_precision * at_recall / total if total > 0 else 0.0,
+        "range_top": float(thresholds[top]) if above else None,
+        "n_pred": at_n_pred,
+        "thin": at_n_pred is not None and at_n_pred < CALIBRATION_MIN_PREDICTIONS,
+    }
+
+
+def _draw_term_calibration(ax, calibration: dict[str, Any], model_key: str, model_label: str,
+                           probability: float) -> None:
+    """One calibration panel: this sub-model's P / R / F1 vs threshold, with the protein's score.
+
+    Both splits go in the same panel (``eval`` solid, ``test`` dashed) rather than in two: the
+    report already carries a lot of panels, and the interesting thing about the two curves is
+    where they disagree, which is only visible when they are overlaid.
+
+    Every annotation sits *outside* the axes -- one line between the title and the plot, and the
+    shared key in its own column -- so the curves have the full 0..1 height to themselves.
+    """
+    thresholds = calibration["thresholds"]
+    term = calibration["term"]
+    headline = []
+
+    for split, line_style in CALIBRATION_SPLIT_STYLES.items():
+        entry = term.get(split)
+        if not entry or model_key not in entry:
+            continue
+        curves = entry[model_key]
+        precision, recall, f1, n_pred = _calibration_curves(curves)
+
+        # Everything to the right of this was never reached by the model on the calibration set,
+        # so nothing there is measured. Shading it stops the reader from reading the empty space
+        # as "precision fell off a cliff".
+        top = _calibrated_range_top(thresholds, precision)
+        if split == "eval" and top is not None and thresholds[top] < 1.0:
+            ax.axvspan(thresholds[top], 1.02, color="#e2e8f0", alpha=0.45, zorder=0)
+
+        # Each curve is drawn twice: solid while enough proteins are above the threshold to make
+        # the rate mean something, faded and thinner once they are not. The two segments overlap by
+        # one point so the line stays connected. `solid` is None when the whole curve is thin.
+        solid = _reliable_upto(n_pred)
+        alpha = 1.0 if split == "eval" else 0.75
+        for values, key, width in ((f1, "f1", 2.0), (precision, "precision", 1.2),
+                                   (recall, "recall", 1.2)):
+            color = CALIBRATION_CURVE_COLORS[key]
+            if solid is not None:
+                ax.plot(thresholds[:solid + 1], values[:solid + 1], line_style,
+                        color=color, lw=width, alpha=alpha)
+            thin_from = 0 if solid is None else solid
+            ax.plot(thresholds[thin_from:], values[thin_from:], line_style, color=color,
+                    lw=width * 0.6, alpha=alpha * CALIBRATION_THIN_ALPHA)
+        # F-max is exact in the file (swept over every distinct score), so the star is a real
+        # optimum and may well sit between two grid points of the curve drawn through it.
+        ax.scatter([curves["fmax_threshold"]], [curves["fmax"]], marker="*", s=110, zorder=6,
+                   color=CALIBRATION_CURVE_COLORS["f1"] if split == "eval" else "none",
+                   edgecolors=CALIBRATION_CURVE_COLORS["f1"], linewidths=1.2)
+
+        at = _calibration_at(thresholds, curves, probability)
+        if at["f1"] is None:
+            headline.append(f"{split} n/a")
+        else:
+            # A star marks a value carried down from the top of the calibrated range; the key
+            # column spells that out, and the shading shows where it applies.
+            carried = "*" if at["range_top"] is not None else ""
+            # Naming the count only when it is small puts the warning exactly where it is needed
+            # and keeps the line short everywhere else.
+            thin = f", {at['n_pred']} above" if at["thin"] else ""
+            headline.append(f"{split} {at['f1']:.2f}{carried} (n={entry['n_gt']:,}{thin})")
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.03)
+    ax.set_yticks(np.round(np.arange(0.0, 1.01, 0.1), 1))
+    ax.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.grid(True, alpha=0.35)
+    ax.tick_params(labelsize=8)
+    ax.axvline(probability, zorder=7, **CALIBRATION_SCORE_LINE)
+
+    if not headline:
+        # Nothing to calibrate against: the term has no annotated protein in either split. Said
+        # plainly, because "we cannot tell you how much to trust this" is itself the answer.
+        ax.text(0.5, 0.5, "no ground-truth protein\nfor this term in eval / test",
+                transform=ax.transAxes, ha="center", va="center", fontsize=9, color="#6b7280")
+
+    # One line between the title and the plot: the score, and the F1 it buys on each split.
+    # Precision and recall are on the curves right behind it; F1 is the single number a reader
+    # takes away, so it is the only one repeated here.
+    summary_line = f"p={probability:.3f}" + ("   F1:  " + "   ".join(headline) if headline else "")
+    ax.set_title(model_label, fontsize=11, fontweight="bold",
+                 color=CALIBRATION_MODEL_COLORS.get(model_key, "#305f72"), pad=17)
+    ax.text(0.0, 1.012, summary_line, transform=ax.transAxes, fontsize=7.5,
+            va="bottom", ha="left", color="#374151")
+
+
+def _draw_calibration_key(key_spec, fig, calibration: dict[str, Any]) -> None:
+    """The row's key and provenance, in a narrow column of its own.
+
+    A legend inside a panel fights the headline for the same corner, and which one loses depends
+    on the term's name and numbers -- so neither gets a corner. This column is drawn last and
+    belongs to no panel.
+    """
+    from matplotlib.lines import Line2D  # noqa: PLC0415 - only needed here
+
+    handles = [Line2D([], [], color=color, lw=2.0 if name == "F1" else 1.3, label=name)
+               for name, color in (("F1", CALIBRATION_CURVE_COLORS["f1"]),
+                                   ("Precision", CALIBRATION_CURVE_COLORS["precision"]),
+                                   ("Recall", CALIBRATION_CURVE_COLORS["recall"]))]
+    handles += [Line2D([], [], color="#64748b", lw=1.4, ls=style, label=f"{split} split")
+                for split, style in CALIBRATION_SPLIT_STYLES.items()]
+    handles += [
+        Line2D([], [], color=CALIBRATION_CURVE_COLORS["f1"], ls="none", marker="*", ms=9,
+               label="F-max (eval)"),
+        Line2D([], [], color="none", ls="none", marker="*", ms=9,
+               markeredgecolor=CALIBRATION_CURVE_COLORS["f1"], markeredgewidth=1.2,
+               label="F-max (test)"),
+        Line2D([], [], label="this protein's score", **CALIBRATION_SCORE_LINE),
+        Line2D([], [], color=CALIBRATION_CURVE_COLORS["f1"], lw=1.2,
+               alpha=CALIBRATION_THIN_ALPHA, label="too few to measure"),
+        Patch(facecolor="#e2e8f0", edgecolor="none", label="no scores this high"),
+    ]
+
+    # Legend and note get a cell each, stacked. Sharing one axes made their overlap depend on how
+    # many entries the legend happened to have, which is not something to leave to chance.
+    legend_share = CALIBRATION_KEY_LEGEND_INCHES / CALIBRATION_ROW_HEIGHT
+    rows = key_spec.subgridspec(2, 1, height_ratios=[legend_share, 1.0 - legend_share], hspace=0.0)
+    ax = fig.add_subplot(rows[0])
+    ax.axis("off")
+    ax.legend(handles=handles, fontsize=6.5, loc="upper left", bbox_to_anchor=(0.0, 1.02),
+              frameon=False, handlelength=1.8, labelspacing=0.42, borderpad=0.0)
+    ax = fig.add_subplot(rows[1])
+    ax.axis("off")
+
+    # The space the run names used to take. A reader who has got this far needs to know how to read
+    # a faded stretch far more than they need three wandb names, which are in summary.json and in
+    # the run directory anyway.
+    splits = calibration.get("splits", {})
+    sizes = [f"{split}: {info.get('n_proteins', 0):,} proteins" for split, info in splits.items()]
+    ax.text(
+        0.0, 0.96,
+        "A curve fades where fewer than\n"
+        f"{CALIBRATION_MIN_PREDICTIONS} proteins of the split score\n"
+        "above the threshold, and stops\n"
+        "where none do.\n"
+        "\n"
+        "* carried down from the top\n"
+        "of the calibrated range.\n"
+        "\n"
+        + "\n".join([f"{calibration['ontology']} datasets"] + sizes),
+        transform=ax.transAxes, fontsize=6, va="top", ha="left", color="#94a3b8",
+        linespacing=1.45)
+
+
+def _draw_calibration_row(fig, row_spec, analysis: dict[str, Any], calibration: dict[str, Any]) -> None:
+    """The three calibration panels (fusion / sequence / structure) as one full-width row."""
+    # Three plot columns plus a narrow one for the key, so no annotation has to share a corner
+    # with the curves or with another annotation.
+    widths = [1.0] * len(CALIBRATION_MODELS) + [0.31]
+    columns = row_spec.subgridspec(1, len(widths), width_ratios=widths, wspace=0.10)
+    for index, (model_key, model_label, probability_key) in enumerate(CALIBRATION_MODELS):
+        ax = fig.add_subplot(columns[index])
+        _draw_term_calibration(ax, calibration, model_key, model_label,
+                               float(analysis[probability_key]))
+        ax.set_xlabel("Score threshold", fontsize=9)
+        # Tick labels on every panel: the three are read against each other, and hunting back to
+        # the leftmost axis for the scale defeats that. Only the axis *title* is not repeated.
+        if index == 0:
+            ax.set_ylabel("Precision / Recall / F1", fontsize=9)
+
+    _draw_calibration_key(columns[len(CALIBRATION_MODELS)], fig, calibration)
+
+
+def calibration_summary(analysis: dict[str, Any]) -> dict[str, Any]:
+    """The calibration row's numbers, for ``summary.json`` -- what the plot shows, machine-readable.
+
+    Per sub-model and split: the term's support, its F-max, and the precision / recall / F1 this
+    protein's own score buys. Empty when the ontology ships no calibration file or the term has no
+    annotated protein in a split.
+    """
+    calibration = analysis.get("calibration")
+    if not calibration:
+        return {}
+
+    thresholds = calibration["thresholds"]
+    result: dict[str, Any] = {}
+    for model_key, _label, probability_key in CALIBRATION_MODELS:
+        probability = float(analysis[probability_key])
+        for split, entry in calibration["term"].items():
+            if model_key not in entry:
+                continue
+            curves = entry[model_key]
+            at = _calibration_at(thresholds, curves, probability)
+            result.setdefault(model_key, {})[split] = {
+                "n_gt": int(entry["n_gt"]),
+                "score": probability,
+                "precision": None if at["precision"] is None else round(at["precision"], 4),
+                "recall": round(at["recall"], 4),
+                "f1": None if at["f1"] is None else round(at["f1"], 4),
+                # True when the score is past the highest threshold at which this model still
+                # predicted this term, so precision and F1 above are carried from
+                # `calibrated_range_top` rather than measured at the score. See _calibration_at.
+                "above_calibrated_range": at["range_top"] is not None,
+                "calibrated_range_top": at["range_top"],
+                # Proteins of the split at or above this score, and whether that is too few for
+                # the rates above to be read as rates. The plot says the same by fading the curve.
+                "n_pred": at["n_pred"],
+                "too_few_predictions": bool(at["thin"]),
+                "fmax": float(curves["fmax"]),
+                "fmax_threshold": float(curves["fmax_threshold"]),
+            }
+    return result
+
+
+#: Columns `interpretability_summary.csv` carries from the calibration, for the fusion model on
+#: the held-out split.
+CALIBRATION_SUMMARY_COLUMNS = ("n_gt", "n_pred", "precision", "recall", "f1", "fmax",
+                               "above_calibrated_range", "too_few_predictions")
+
+
+def _calibration_summary_columns(analysis: dict[str, Any]) -> dict[str, Any]:
+    """``calib_eval_*`` columns; every key present, ``None`` where there is no calibration."""
+    numbers = (calibration_summary(analysis).get("fusion", {}) or {}).get("eval") or {}
+    return {f"calib_eval_{key}": numbers.get(key) for key in CALIBRATION_SUMMARY_COLUMNS}
+
+
 def plot_sequence_analysis(analysis: dict[str, Any], save_path: Path | None = None):
     x = np.arange(1, int(analysis["residue_count"]) + 1)
     top_residues = analysis["top_residues"]["residue_index_1based"].tolist()
@@ -1217,21 +1630,41 @@ def plot_sequence_analysis(analysis: dict[str, Any], save_path: Path | None = No
     #
     # tight_layout, not constrained_layout: the latter shrinks these part-width map axes to ~2.8"
     # when the figure also holds full-width tracks, which flattens the maps.
-    MAP_SIZE = 6.0            # inches, per map -- both maps get exactly this, so both are square
-    panel_heights = [2.2, 2.2, 2.2, MAP_SIZE, 2.2, 3.0]
+    #
+    # The calibration row sits on top of all of it and is the odd one out: its x axis is a score
+    # threshold, not a residue index, so it is neither shared with the tracks nor spanned by the
+    # activity-site bands. It is only drawn when the ontology's calibration file was shipped, and
+    # everything below shifts down by `offset` when it is.
+    # Row height in inches. It is not the size the maps come out: the row also pays for their
+    # title, xlabel and tick labels, and squaring them (below) trims the surplus width, so a map
+    # lands at roughly MAP_SIZE - 1.2 on a side. Raised from 6.0 to keep the squared maps as large
+    # as the stretched ones used to be.
+    MAP_SIZE = 7.0
+    calibration = analysis.get("calibration")
+    offset = 1 if calibration else 0
+    # One height for every residue-index line panel. They are read against each other -- a peak in
+    # the sequence signal is compared with the same residue in the structure signals and in the
+    # combined one -- and equal heights mean equal vertical scale per panel, so a taller-looking
+    # feature is a stronger one rather than one that happened to land in a roomier panel.
+    TRACK_HEIGHT = 3.4        # inches
+    panel_heights = (([CALIBRATION_ROW_HEIGHT] if calibration else [])
+                     + [TRACK_HEIGHT] * 3 + [MAP_SIZE] + [TRACK_HEIGHT] * 2)
     fig = plt.figure(figsize=(16, sum(panel_heights)))
     grid = fig.add_gridspec(len(panel_heights), 1, height_ratios=panel_heights)
 
-    track_rows = (0, 1, 2, 4, 5)
+    if calibration:
+        _draw_calibration_row(fig, grid[0], analysis, calibration)
+
+    track_rows = tuple(offset + row for row in (0, 1, 2, 4, 5))
     axes = []
     for row in track_rows:
         shared = axes[0] if axes else None
         axes.append(fig.add_subplot(grid[row], sharex=shared))
     # Keep panel numbering readable below: axes[0..2] curves, axes[3] maps row, axes[4:] curves.
     axes = axes[:3] + [None] + axes[3:]
-    for ax in axes[:3]:
-        ax.tick_params(labelbottom=False)
-    axes[4].tick_params(labelbottom=False)
+    # Every track keeps its own residue tick labels even though they share the axis. The panels are
+    # tall and the maps row sits between them, so reading a peak off the bottom-most axis means
+    # tracking a vertical across a foot of figure; repeating the labels costs one line of ticks.
 
     # The maps row gets its own column layout with the colorbars as *separate* axes. Attaching them
     # to the map axes instead would steal width from the map -- and steal different amounts from each
@@ -1242,7 +1675,7 @@ def plot_sequence_analysis(analysis: dict[str, Any], save_path: Path | None = No
     # the outer bar's right-hand labels and the right map's y axis.
     #   map | flipped bar's labels | bar | gap | bar | labels + right map's y axis | map | gap | bar | slack
     map_widths = [MAP_SIZE, 0.62, 0.16, 0.08, 0.16, 1.15, MAP_SIZE, 0.10, 0.16, 0.50]
-    map_grid = grid[3].subgridspec(1, len(map_widths), width_ratios=map_widths, wspace=0.0)
+    map_grid = grid[offset + 3].subgridspec(1, len(map_widths), width_ratios=map_widths, wspace=0.0)
     map_axes = (fig.add_subplot(map_grid[0]), fig.add_subplot(map_grid[6]))
     # Inner bar first in the list, so the flipped one sits next to the left map.
     left_caxes = (fig.add_subplot(map_grid[2]), fig.add_subplot(map_grid[4]))
@@ -1380,6 +1813,14 @@ def plot_sequence_analysis(analysis: dict[str, Any], save_path: Path | None = No
         y=0.997,
     )
     fig.tight_layout(h_pad=0.9, rect=(0, 0, 1, 0.985))
+    # Square maps, forced *after* tight_layout because only then is the cell they have to fit in
+    # known. MAP_SIZE sizes the row, but the row also pays for the maps' title, xlabel and tick
+    # labels and for the padding tight_layout inserts between rows -- which grows with the number
+    # of rows -- so the cell is always somewhat shorter than MAP_SIZE while staying its full width.
+    # aspect="auto" (set by imshow) then stretches an L x L matrix into that letterbox.
+    # "box" shrinks the axes itself to the largest square that fits, instead of scaling the data.
+    for ax in map_axes:
+        ax.set_aspect("equal", adjustable="box", anchor="C")
     if save_path is not None:
         fig.savefig(save_path, dpi=140, bbox_inches="tight")
         plt.close(fig)
@@ -2685,6 +3126,7 @@ def save_analysis_bundle(
         "gate": float(analysis["gate"]),
         "seq_branch_weight": float(analysis["seq_branch_weight"]),
         "struct_branch_weight": float(analysis["struct_branch_weight"]),
+        "calibration": calibration_summary(analysis),
         "residues_csv": str(residues_path),
         "top_residues_csv": str(top_residues_path),
         "activity_site_candidates_csv": str(activity_sites_path),
@@ -2781,6 +3223,7 @@ def analyze_records_with_interpretability(
     save_workers: int = 1,
     models_by_ontology: dict[str, Any] | None = None,
     go_terms_mappings_by_ontology: dict[str, Any] | None = None,
+    calibration: "Calibration | None" = None,
     write_summary: bool = True,
 ) -> tuple[pd.DataFrame, dict[tuple[str, str], Any]]:
     """Analyze the selected GO terms of every record and save one report bundle per term.
@@ -2812,6 +3255,8 @@ def analyze_records_with_interpretability(
             term is analyzed.
         models_by_ontology / go_terms_mappings_by_ontology: per-aspect models and label maps used to
             resolve custom terms outside the primary ontology.
+        calibration: per-GO-term precision / recall curves (see :class:`Calibration`). When given,
+            every report gains the calibration row that says what the term's score is worth.
         write_summary: write ``interpretability_summary.csv`` under ``output_dir``. Set False when
             the caller collects the returned frames itself (e.g. to stream one CSV across batches).
 
@@ -2836,7 +3281,15 @@ def analyze_records_with_interpretability(
         else:
             paths = save_analysis_bundle(analysis, output_dir=output_dir, log_runtime=bool(log_runtime))
         save_elapsed = float(paths.get("save_bundle_s", 0.0))
-        total_elapsed = float(item["analysis_elapsed"]) if save_in_background else float(item["analysis_elapsed"]) + save_elapsed
+        # Analysis *and* writing the bundle out -- what the report cost, whichever thread paid for
+        # it. Saving is the larger half (plots at 140 dpi, the 3D viewer, five tables: seconds, next
+        # to ~1s of attribution), so leaving it out of a number called "total" made the per-report
+        # lines irreconcilable with the run's own "Interpretability time".
+        #
+        # With --save_workers > 0 a save overlaps the next term's analysis, so these totals may add
+        # up to slightly more than the wall-clock figure at the end of the run. That is what the
+        # overlap buys, and it is the honest direction to be wrong in: the alternative hid the cost.
+        total_elapsed = float(item["analysis_elapsed"]) + save_elapsed
         _log_runtime_step(bool(log_runtime), str(item["record"]["protein_id"]), item["go_term"], "term_total", total_elapsed)
         top_residue = item["top_residue"]
         top_activity = item["top_activity"]
@@ -2861,6 +3314,11 @@ def analyze_records_with_interpretability(
                 "struct_prob": float(analysis["struct_prob"]),
                 "esm_prob": float(analysis["esm_prob"]),
                 "gate": float(analysis["gate"]),
+                # What the fusion score is worth for this term on the held-out split: the
+                # headline of the calibration row, so a run's whole summary can be sorted by it.
+                # Always present, empty when uncalibrated -- the CSV is appended batch by batch
+                # under a header written once, so the columns cannot vary between rows.
+                **_calibration_summary_columns(analysis),
                 "top_residue_index_1based": int(top_residue["residue_index_1based"]),
                 "top_residue_aa": str(top_residue["residue_aa"]),
                 "top_residue_score": float(top_residue["combined_abs"]),
@@ -2933,6 +3391,9 @@ def analyze_records_with_interpretability(
                     log_runtime=bool(log_runtime),
                 )
                 analysis["go_term_name"] = go_term_name
+                # None for an unknown term (or no calibration file): plot_sequence_analysis then
+                # simply leaves the row out.
+                analysis["calibration"] = calibration.for_term(go_term) if calibration is not None else None
                 analysis["true_residue_indices_1based"] = _resolve_true_residue_indices(
                     str(record["protein_id"]),
                     str(go_term),

@@ -64,7 +64,8 @@ Interpretability options (rarely changed; defaults match the published reports)
 
 Output (under <output_dir>)
 ------
-    <protein>/<GO_id>/sequence_analysis.png        : per-residue attribution curves (both branches).
+    <protein>/<GO_id>/sequence_analysis.png        : per-GO-term calibration (top row) and the
+                                                     per-residue attribution curves (both branches).
     <protein>/<GO_id>/kernel_distmap.png           : distogram-level attribution and top kernel windows.
     <protein>/<GO_id>/structure_analysis.html      : interactive 3D viewer coloured by attribution.
     <protein>/<GO_id>/residues.csv                 : every residue with all attribution signals.
@@ -75,6 +76,16 @@ Output (under <output_dir>)
     <protein>/<GO_id>/summary.json                 : the report's headline numbers and file paths.
     interpretability_summary.csv                   : one row per analyzed protein/GO-term pair.
     prediction_summary.csv, preds/, preds_propagated/, log.txt : as in ``deepfri2.py``.
+
+Calibration (optional)
+----------------------
+    ``params/<ontology>/calibration_<fusion run>.json`` holds, per GO term and per sub-model, the
+    precision / recall the model reaches at every score threshold on the evaluation and test
+    splits. When it is present each report opens with a row saying what this protein's score is
+    actually worth *for this term* -- an ontology-wide CAFA number cannot, since the useful
+    threshold differs by an order of magnitude between a common term and a rare one. The file is
+    produced by ``deepFRI2-trainer/calibrate.py`` and copied in by hand alongside the checkpoints;
+    without it every report is written exactly as before, minus that row.
 
 ESM weights must be present locally (run ``src/deepFRI2/download_esm.py`` once); deepFRI2
 head checkpoints are expected under ``params/<ontology>/``.
@@ -92,6 +103,7 @@ from config import (
     ESM_DIM,
     GO_VERSION,
     MAX_SEQ_LEN,
+    MODEL_NAMES,
     ONTOLOGIES,
     SIGMA_DIST,
 )
@@ -248,7 +260,8 @@ def run_interpretability(input_dir, output_dir, file_names, models, tokenizer, e
                          go_terms_mappings, descendant_indices_by_ontology, go_name_map,
                          batch_size, threshold, top_k, aspects, options,
                          prop=False, summary_only=False, log_runtime=False,
-                         custom_terms_by_protein=None, custom_true_residues=None):
+                         custom_terms_by_protein=None, custom_true_residues=None,
+                         params_dir=None):
     """Run inference and write interpretability reports, one inference batch at a time.
 
     Each batch is parsed, embedded and predicted once; its reports are written before the next
@@ -256,7 +269,9 @@ def run_interpretability(input_dir, output_dir, file_names, models, tokenizer, e
 
     ``options`` holds the interpretability knobs (see ``parse_args``). ``threshold`` is the
     ``(fusion_and_sequence, structure)`` pair used for the prediction summary; its first value also
-    decides which terms are reported. Returns ``(prediction_summary_path, interpretability_summary_path)``.
+    decides which terms are reported. Every report gains a per-GO-term calibration row when
+    ``params_dir/<ontology>/calibration_<fusion run>.json`` was shipped alongside the checkpoints.
+    Returns ``(prediction_summary_path, interpretability_summary_path)``.
     """
     import matplotlib
     import pandas as pd
@@ -267,7 +282,11 @@ def run_interpretability(input_dir, output_dir, file_names, models, tokenizer, e
     # display, which can only slow the run down or fail).
     matplotlib.use("Agg")
 
-    from interpret_utils import analyze_records_with_interpretability, build_interpretability_records
+    from interpret_utils import (
+        Calibration,
+        analyze_records_with_interpretability,
+        build_interpretability_records,
+    )
     from utils import (
         build_all_prediction_table,
         build_prediction_summary,
@@ -277,6 +296,11 @@ def run_interpretability(input_dir, output_dir, file_names, models, tokenizer, e
         prepare_batches_for_inference,
         propagate_prediction_record,
     )
+
+    # Optional, and shipped by whoever trained the checkpoints (deepFRI2-trainer/calibrate.py):
+    # per-GO-term precision / recall curves saying what a score on this term is actually worth.
+    # Absent -> reports are written exactly as before, without the calibration row.
+    calibration = Calibration.load(params_dir or PARAMS_DIR, MODEL_NAMES, ontologies=aspects)
 
     output_dir = Path(output_dir)
     preds_dir = output_dir / "preds"
@@ -445,6 +469,7 @@ def run_interpretability(input_dir, output_dir, file_names, models, tokenizer, e
                 save_workers=max(1, options.save_workers),
                 models_by_ontology=models,
                 go_terms_mappings_by_ontology=mappings_by_aspect,
+                calibration=calibration,
                 write_summary=False,
             )
             interpretability_elapsed += time.perf_counter() - interpretability_start
