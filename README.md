@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/Tomasz-Lab/deepFRI2?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2/blob/main/LICENSE)
 [![Issues](https://img.shields.io/github/issues/Tomasz-Lab/deepFRI2?style=flat-square)](https://github.com/Tomasz-Lab/deepFRI2/issues)
 
-deepFRI2 is an upgraded version of the well-established [deepFRI](https://www.nature.com/articles/s41467-021-23303-9) (*Deep Functional Residue Identification*) framework for predicting protein function using [Gene Ontology](https://geneontology.org/) (GO) terms and [Enzyme Commission](https://enzyme.expasy.org/) (EC) numbers.
+deepFRI2 is an upgraded version of the well-established [deepFRI](https://www.nature.com/articles/s41467-021-23303-9) (*Deep Functional Residue Identification*) framework for predicting protein function using [Gene Ontology](https://geneontology.org/) (GO) terms.
 
 Like its predecessor, deepFRI2 operates in two complementary modes: sequence-based and sequence–structure-based. This dual approach enables robust functional inference in metagenomic settings — where protein structures are often unavailable — as well as structure-informed functional annotation when structural information is available.
 
@@ -105,16 +105,18 @@ For a quick overview of predicted functions, please take a look at the `pred_pro
 
 ## Runtime
 
-End-to-end runtime (excluding model loading at startup, which usually takes a couple of seconds per run) depends primarily on the available compute resources and the protein length. Initial benchmarks with the default settings (batch size: 32) yielded the following throughput:
+End-to-end runtime, excluding model loading at startup (which typically takes a couple of seconds per run), depends primarily on the available computational resources and protein length. Initial benchmarks using the default batch size of 32 yielded the following throughput:
 
-- 0.2–0.4 s/protein — GPU (NVIDIA A100)
-- 0.7–1.5 s/protein — CPU (48-core server)
+|  | GPU (NVIDIA A100) | CPU server (48 cores) | Laptop (Apple M3 Pro, 11 cores) |
+|---|:---:|:---:|:---:|
+| Fusion | 0.2–0.3 | 0.6–1.3 |  33 |
+| Sequence | 0.1–0.2 |  0.4–1.0 |  2.3–6.2 |
 
-These measurements were obtained on protein datasets with median sequence lengths of 150–440 amino acids. Additional benchmarking is underway, and the results will be shared in future updates.
+These measurements, with the exception of the laptop benchmark for the fusion model (where a dataset with shorter proteins was used), were obtained on protein datasets with median sequence lengths ranging from 150 to 440 amino acids.
 
-For large-scale inference, we recommend a GPU or a multi-core CPU cluster. On CPU, ESM embeddings are computed one sequence at a time, each forward using all available core.
+For large-scale inference, we recommend using a GPU or a multi-core CPU server. On CPU, ESM embeddings are computed one sequence at a time, with each forward pass utilizing all available cores.
 
-Running the model on a personal computer (e.g., a laptop) is also possible. Initial tests on an Apple M3 Pro (11 CPU cores, 18 GB RAM) with a small set of proteins (median length ~150 aa; batch size: 32) took ~1.8 s/protein for embedding generation and ~32 s/protein for model inference — the structure model is markedly slower here because Apple-Silicon PyTorch ships a generic (non-MKL) CPU build. Local CPU inference is therefore best suited to small runs (e.g., select a subset of .cif/.pdb files with `--ids_file`) or with sequence-only mode (in such case, inference time drastically decreases to 2 s/protein).
+The model can also be run on a personal computer, such as a laptop. The structure model is considerably slower on Apple Silicon because the PyTorch CPU build does not use MKL. Local CPU inference is therefore best suited for small runs (e.g., by selecting a subset of `.cif`/`.pdb` files with `--ids_file`) or for sequence-only inference. In the latter case, most of the computation time is spent generating embeddings (approximately 97–99%), while the actual model inference is very fast.
 
 ## Future releases
 
